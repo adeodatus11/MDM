@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.conf import settings
 from django.contrib.auth.admin import UserAdmin, GroupAdmin
 from django.contrib.auth.models import User, Group
 from .models import School, Room, Membership, Device, AuditEvent
@@ -7,7 +8,8 @@ from .models import School, Room, Membership, Device, AuditEvent
 class RestrictedAdminSite(admin.AdminSite):
     site_header = "School RMM — administracja"
     def has_permission(self, request):
-        return request.user.is_active and request.user.is_superuser
+        return request.user.is_active and request.user.is_superuser and (
+            not settings.REQUIRE_MFA or request.user.is_verified())
 
 
 site = RestrictedAdminSite(name="admin")

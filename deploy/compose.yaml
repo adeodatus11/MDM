@@ -1,0 +1,72 @@
+name: school-rmm
+services:
+  app:
+    image: school-rmm:local
+    build:
+      context: ..
+    restart: unless-stopped
+    environment:
+      SCHOOL_RMM_DEBUG: "false"
+      SCHOOL_RMM_SECRET_KEY_FILE: /run/secrets/django_key
+      SCHOOL_RMM_ALLOWED_HOSTS: ${SCHOOL_RMM_HOST:?Run init_deployment first},localhost,127.0.0.1,[::1]
+      SCHOOL_RMM_TRUST_PROXY: "true"
+      NO_PROXY: app,proxy,localhost,127.0.0.1,::1
+      no_proxy: app,proxy,localhost,127.0.0.1,::1
+    secrets:
+      - django_key
+    volumes:
+      - app_data:/data
+      - static_data:/srv/static
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  proxy:
+    image: caddy:2-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      SCHOOL_RMM_HOST: ${SCHOOL_RMM_HOST:?Run init_deployment first}
+      NO_PROXY: app,proxy,localhost,127.0.0.1,::1
+      no_proxy: app,proxy,localhost,127.0.0.1,::1
+    ports:
+      - "${SCHOOL_RMM_BIND_ADDRESS:-127.0.0.1}:${SCHOOL_RMM_HTTPS_PORT:-443}:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - static_data:/srv/static:ro
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+      - edge
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  backend:
+    internal: true
+  edge: {}
+volumes:
+  app_data:
+  static_data:
+  caddy_data:
+  caddy_config:
+secrets:
+  django_key:
+    file: ./runtime/django.key

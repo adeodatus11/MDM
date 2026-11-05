@@ -16,9 +16,34 @@ django==5.2.19 \
     # via
     #   -r requirements.in
     #   django-axes
-django-axes==8.3.1 \
+    #   django-formtools
+    #   django-ipware
+    #   django-otp
+    #   django-phonenumber-field
+    #   django-two-factor-auth
+django-axes[ipware]==8.3.1 \
     --hash=sha256:d57e923c0ba33cf45275253dd1313c3a3ff04bec686b38d677beb2b3d43c7bcd \
     --hash=sha256:f7887582fd12713064f1602091ff6152752becae5e891a15bf802746cab0f51a
+    # via -r requirements.in
+django-formtools==2.7 \
+    --hash=sha256:06e4ab1f9c999f5b2ec6670cb2d51b77117599f4f17c5855f38de158b1c7f247 \
+    --hash=sha256:52b30c08571108023937e4b5d96a5cc35282ff0a2e51630aeea00e27d723d3ac
+    # via django-two-factor-auth
+django-ipware==8.0.0 \
+    --hash=sha256:377cc7926ea377d8f544511b019cd32b28060e1c9caa3d0c43c3e5e923560f33 \
+    --hash=sha256:63e9e589aa58c37fbcd3f7624d18a08e69d95b03c84bab7e5ad2a12b03f8c4ec
+    # via django-axes
+django-otp==1.7.5 \
+    --hash=sha256:475d4111e07d61616996f098d08d29884da6397273a11f53c1b8e8c75d27e1dc \
+    --hash=sha256:7f554d21dcd035550c3b8e3f154b1f422fee71fdc75c8a3bf96e42a2ea6dafcc
+    # via django-two-factor-auth
+django-phonenumber-field==8.5.0 \
+    --hash=sha256:19c606fda7bb25630c4913f7ac83c1824186ea17e2e4c6dc9aa9373e8f5843c5 \
+    --hash=sha256:a6dd71250f7fd0724aad995df01bdb4ac457a65622f120d0d623792fe8283798
+    # via django-two-factor-auth
+django-two-factor-auth==1.18.1 \
+    --hash=sha256:9d624db63123141cd95a6afe3d626105c3c29a7c8e25a3d93411dd1fac0be464 \
+    --hash=sha256:ccc9cee10be880037914e572389be6dcae93947709a8a9ff01fb23f7dee254f2
     # via -r requirements.in
 gunicorn==23.0.0 \
     --hash=sha256:ec400d38950de4dfd418cff8328b2c8faed0edb0d517d3394e457c317908ca4d \
@@ -28,6 +53,18 @@ packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
     # via gunicorn
+phonenumberslite==9.0.42 \
+    --hash=sha256:7ae0a97b12e9f0749e7bed2c9c3da4df43648ea5ba021de86b36088d98a0915e \
+    --hash=sha256:fc87e72d76d48ddbd4ebd97a42abe723787ff7d3336123dcf6dafc0f6e1f5c21
+    # via -r requirements.in
+python-ipware==4.1.1 \
+    --hash=sha256:52eedd4cb7bb9e1bb6b9dd92db974e729fe54be22e1389703e21c60344b9f039 \
+    --hash=sha256:fd6102058e74c29112b4376f8abbae718852c95f8de6965801de88ca9780d22f
+    # via django-ipware
+qrcode==8.2 \
+    --hash=sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f \
+    --hash=sha256:35c3f2a4172b33136ab9f6b3ef1c00260dd2f66f858f24d88418a015f446506c
+    # via django-two-factor-auth
 sqlparse==0.6.1 \
     --hash=sha256:3be5a72d04c873d690d7c6dedd33d6fae2ef82759881ceec02fc2efd0cba564f \
     --hash=sha256:ca722573f848ff2d30e40ea30f53a104b7dea7635ea9285891263eb2c58fb6e7

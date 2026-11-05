@@ -3,10 +3,13 @@
 Rozpoczęta aplikacja do zarządzania komputerami szkolnymi Windows 10/11 Home/Pro.
 Stan: **działający lokalny etap 1 — panel ewidencji i oceny zgodności**.
 Kod znajduje się w tym repozytorium; wdrożenie na Proxmox nie zostało jeszcze wykonane.
+Pakiet Docker z Gunicorn, Caddy, HTTPS, obowiązkowym MFA i trwałymi wolumenami
+opisuje [deploy/README.md](deploy/README.md).
 
 ## Co działa
 
 - Logowanie imiennym kontem Django, ochrona CSRF i ograniczenie prób logowania.
+- Obowiązkowy TOTP i kody odzyskiwania w trybie wdrożeniowym, przez django-two-factor-auth.
 - Szkoła → budynek → piętro → sala → komputer.
 - Ręczne dodawanie komputerów, inwentaryzacja i import raportów JSON.
 - Rozdzielenie dostępu między szkołami; administrator główny, administrator szkoły i technik.
@@ -93,6 +96,6 @@ Przygotowanie Proxmoxa: [docs/PROXMOX.md](docs/PROXMOX.md).
 
 Zdalny pulpit, terminal, wykonanie skryptów, restart, automatyczna rejestracja
 agentów i wdrażanie polityk **nie są jeszcze zaimplementowane**. Panel pokazuje
-ten stan wprost. MFA, pełny audyt operacji zdalnych, TLS na serwerze, kopie
-zapasowe z odtwarzaniem i bezpieczna integracja agentów są wymagane przed pilotażem
+ten stan wprost. Pakiet wdrożeniowy ma MFA i HTTPS; pełny audyt operacji zdalnych,
+wdrożenie na docelowym serwerze, kopie z odtworzeniem VM i integracja agentów są wymagane przed pilotażem
 w szkolnej sieci. Obecna wersja nie jest gotowa do produkcyjnego zarządzania flotą.

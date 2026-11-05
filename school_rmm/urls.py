@@ -1,11 +1,16 @@
 from inventory.admin import site
 from django.contrib.auth import views as auth
-from django.urls import path
+from django.conf import settings
+from django.urls import include, path
+from django.views.generic import RedirectView
+from two_factor.urls import urlpatterns as two_factor_urls
 from inventory import views
 
 urlpatterns = [
+    path("", include(two_factor_urls)),
     path("admin/", site.urls),
-    path("login/", auth.LoginView.as_view(template_name="registration/login.html"), name="login"),
+    path("login/", RedirectView.as_view(pattern_name="two_factor:login") if settings.REQUIRE_MFA else
+         auth.LoginView.as_view(template_name="registration/login.html"), name="login"),
     path("logout/", auth.LogoutView.as_view(), name="logout"),
     path("healthz/", views.health, name="health"),
     path("", views.devices, name="devices"),

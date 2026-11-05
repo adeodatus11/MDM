@@ -5,4 +5,5 @@ __pycache__/
 var/
 .coverage
 staticfiles/
+deploy/runtime/
 node_modules/

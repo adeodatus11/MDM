@@ -4,5 +4,5 @@
 <body><header><a class="brand" href="{% url 'devices' %}">S<span>School RMM<small>Przestrzeń administracji IT</small></span></a>
 {% if user.is_authenticated %}<div class="account"><span>{{ user.username }}</span><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="quiet">Wyloguj</button></form></div>{% endif %}</header>
 <main>{% if user.is_authenticated %}<nav><a href="{% url 'devices' %}">Komputery</a><a href="{% url 'device-create' %}">Dodaj do ewidencji</a>{% if user.is_superuser %}<a href="/admin/">Szkoły, sale i konta</a>{% endif %}<span class="stage">Wersja rozwojowa · Etap 1</span></nav>{% endif %}
-{% for message in messages %}<p class="notice">{{ message }}</p>{% endfor %}{% block content %}{% endblock %}</main>
+{% for message in messages %}<p class="notice">{{ message }}</p>{% endfor %}{% block content_wrapper %}{% block content %}{% endblock %}{% endblock %}</main>
 <footer>School RMM · Zdalne operacje zostaną udostępnione po podłączeniu i sprawdzeniu agentów.</footer></body></html>

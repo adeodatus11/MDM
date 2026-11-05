@@ -1,0 +1,10 @@
+.git
+.venv
+var
+__pycache__
+**/__pycache__
+**/*.pyc
+.env
+deploy/.env
+deploy/runtime
+staticfiles
