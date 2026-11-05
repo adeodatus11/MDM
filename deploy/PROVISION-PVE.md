@@ -109,6 +109,41 @@ z prawami do odczytu przez rmmadmin. Można go pobrać na Maca przez SCP z opcj�
 Prywatny klucz CA i klucz Django nie są eksportowane. Konto administratora i MFA
 działają tak samo jak w pierwotnej ścieżce. Otwarcie panelu nadal wymaga szkolnego LAN.
 
+#### DNS zatrzymujący budowę Dockera
+
+Operator wykonał snapshot `before-ssh-32ba758b6201` i uruchomił tryb SSH.
+Potwierdzono źródła, zachowano klucz i ustawienia oraz wdrożono rozdzielone reguły
+SSH i HTTPS. Budowa zatrzymała się na zapytaniu o registry-1.docker.io do lokalnego
+stub resolvera 127.0.0.53. Restart systemd-resolved nie wystarczył; `resolvectl dns`
+pokazuje na eth0 serwery 10.76.10.19 i 10.76.10.20, a getaddrinfo nadal zwraca EAI_AGAIN.
+
+`repair_guest_dns.py` działa wyłącznie z sudo w school-rmm, sprawdzając także MAC
+bc:24:11:d5:48:c7 i adres z 192.168.16.0/22. Domyślnie tylko diagnozuje.
+Z `--apply` sprawdza odpowiedzi UDP DNS A i AAAA: najpierw serwery obecne w VM,
+potem jej bramę i serwery znane z wcześniejszej konfiguracji pve (192.168.0.1, 8.8.8.8).
+Prawidłowe NOERROR bez rekordów AAAA jest dopuszczone dla usług IPv4.
+Nie kopiuje MagicDNS 100.100.100.100. Jeśli żaden kandydat nie odpowiada, nie zmienia DNS.
+
+Po wybraniu działającego serwera zapisuje kopię dotychczasowych ustawień w
+`/var/backups/school-rmm/dns-*` oraz odrębny drop-in
+`/etc/systemd/resolved.conf.d/90-school-rmm-dns.conf`. Ustawia w nim przetestowany
+DNS i domenę routingu ~. dla nazw publicznych; konfiguracja DNS poszczególnych łączy
+pozostaje zachowana. Restartuje wyłącznie systemd-resolved w VM i sprawdza systemowe
+rozwiązywanie nazw registry-1.docker.io, auth.docker.io, pypi.org oraz files.pythonhosted.org.
+Nieudany test przywraca poprzedni plik i ponownie uruchamia resolver.
+Host pve, jego DNS/Tailscale, vmbr0, interfejsy i inne VM nie są modyfikowane.
+
+Plik można pobrać i sprawdzić SHA256 na Macu, a następnie przekazać przez stdin
+działającego SSH:
+
+```sh
+ssh -J root@proxmox-pve.taila141c0.ts.net rmmadmin@192.168.18.2 \
+  'sudo -n python3 - --apply' < /ścieżka/do/zweryfikowanego/pliku
+```
+
+Ta naprawa nie wymaga działającego DNS w VM do pobrania skryptu.
+Po powodzeniu ponowić zweryfikowany instalator `--guest-resume` zapisany w VM.
+
 #### Wznowienie przez sprawnego agenta QEMU
 
 Z istniejącego terminala `root@pve`, po pobraniu i sprawdzeniu nowego instalatora:
