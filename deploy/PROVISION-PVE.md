@@ -55,7 +55,11 @@ DHCP należy następnie zarezerwować w routerze. Adres MAC nowej VM jest w `qm 
 Nie dodawać przekierowania ani SNAT/VPN, które przedstawiałyby klienta zewnętrznego
 jako adres z sieci szkolnej. Instalator nie zmienia i nie sprawdza routera.
 
-Z Maca należy uruchamiać blok zawierający `ssh -t root@192.168.0.250`.
+Z Maca należy uruchamiać blok zawierający `ssh -t root@proxmox-pve.taila141c0.ts.net`
+(sprawdzony przez operatora dostęp Tailscale spoza LAN). Adres `root@192.168.0.250`
+pozostaje lokalną ścieżką SSH. Zmiana sieci Maca nie zmienia `--school-lan 192.168.16.0/22`.
+School RMM nie jest publikowany przez Tailscale. Nie zmieniać vmbr0, VLAN-aware,
+głównego interfejsu ani accept-dns=false; nie resetować Tailscale bez dostępu alternatywnego.
 Polecenia instalatora wykonują się na pve. Samodzielne uruchomienie bloku z /root
 na Macu kończy się błędem mktemp przed jakąkolwiek zmianą na Proxmoxie.
 

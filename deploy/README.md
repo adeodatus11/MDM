@@ -19,14 +19,16 @@ Kontenery aplikacji uruchamia się wewnątrz osobnej VM Linux, nie na hoście Pr
 Węzeł wskazany przez właściciela: `pve`, API `https://192.168.0.250:8006`.
 Próba odczytu API zatrzymała się na proxy środowiska (CONNECT 403), przed
 połączeniem z Proxmox. Następnie właściciel uruchomił instalator przez swoje SSH:
-utworzono osobną VM 104, działa agent QEMU, ale pierwsze uruchomienie zatrzymało się
+utworzono osobną VM 104; początkowe odczyty przez agenta QEMU działały, ale pierwsze uruchomienie zatrzymało się
 na błędnym sprawdzeniu podsieci po wypakowaniu aplikacji. Panel nie jest jeszcze
 potwierdzony jako uruchomiony. Naprawę bez odtwarzania dysku opisuje
 [tryb wznowienia](PROVISION-PVE.md#wznowienie-zatrzymanej-instalacji).
-Użytkownik wskazał SSH root@192.168.0.250:22 z istniejącym kluczem, jednak ten
-klucz ani agent SSH nie są dostępne w tej sesji. Instalację wykonuje właściciel
-z lokalnej sieci przez istniejący terminal SSH. Połączenie z chmury do szkolnej
-sieci i VPN nie są potrzebne do tego wdrożenia.
+Najnowsza próba wznowienia zwróciła timeout guest-exec przed snapshotem i zmianą zapory;
+wymaga odczytu stanu agenta. Operator potwierdził teraz dostęp kluczem przez Tailscale:
+`ssh root@proxmox-pve.taila141c0.ts.net`. Ta ścieżka działa z Maca również poza LAN.
+Sesja chmurowa nadal nie ma skonfigurowanego VPN ani klucza SSH. Dostęp do panelu
+School RMM pozostaje wyłącznie w szkolnym LAN. Zasady utrzymania Tailscale, DNS
+i pojedynczego NIC hosta są zapisane w [docs/PROXMOX.md](../docs/PROXMOX.md).
 Wcześniej zapisany wymóg tokenu API nie jest potrzebny przy wybranej ścieżce SSH.
 Nie wystawiać panelu Proxmox do Internetu w celu obejścia tego wymagania.
 
