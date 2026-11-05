@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 import tarfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 from deploy import provision_pve as p
 
 
@@ -163,11 +163,11 @@ class LANOnlyTests(unittest.TestCase):
         self.files = {item["path"]:item["content"] for item in p.guest_config(b"source")["write_files"]}
         self.firewall = self.files["/usr/local/sbin/school-rmm-firewall"]
 
-    def verdict(self, address):
+    def verdict(self, address, chain="SCHOOL_RMM_WEB"):
         # Evaluate the actual generated IPv4 rule list for representative clients.
         import ipaddress
         for line in self.firewall.splitlines():
-            if not line.startswith("-A SCHOOL_RMM_WEB "):
+            if not line.startswith("-A " + chain + " "):
                 continue
             fields = shlex.split(line)
             if "-s" in fields and ipaddress.ip_address(address) not in ipaddress.ip_network(fields[fields.index("-s")+1]):
@@ -189,9 +189,30 @@ class LANOnlyTests(unittest.TestCase):
         self.assertNotIn("ESTABLISHED", self.firewall)
         self.assertNotIn("SSH_CONNECTION", self.firewall)
         self.assertNotIn("192.168.17.", self.firewall)
-        self.assertIn("--dport 22 -j SCHOOL_RMM_WEB", self.firewall)
+        self.assertIn("--dport 22 -j SCHOOL_RMM_SSH", self.firewall)
         self.assertIn("--dport 8443 -j SCHOOL_RMM_WEB", self.firewall)
         self.assertIn("-A SCHOOL_RMM_WEB6 -j DROP", self.firewall)
+
+    def test_default_ssh_also_restricts_access_to_school_lan(self):
+        self.assertEqual(self.verdict("192.168.17.206", "SCHOOL_RMM_SSH"), "ACCEPT")
+        self.assertEqual(self.verdict("192.168.0.250", "SCHOOL_RMM_SSH"), "DROP")
+
+    def test_explicit_pve_maintenance_exception_only_applies_to_ssh(self):
+        files = {item["path"]:item["content"] for item in p.guest_config(b"source", maintenance_host=p.MAINTENANCE_HOST)["write_files"]}
+        self.firewall = files["/usr/local/sbin/school-rmm-firewall"]
+        bootstrap = files["/usr/local/sbin/school-rmm-firstboot"]
+        self.assertNotIn("systemctl enable --now qemu-guest-agent", bootstrap)
+        self.assertIn("systemctl enable --now docker", bootstrap)
+        subprocess.run(["bash", "-n"], input=bootstrap.encode(), check=True)
+        self.assertEqual(self.verdict("192.168.0.250", "SCHOOL_RMM_SSH"), "ACCEPT")
+        self.assertEqual(self.verdict("192.168.0.250"), "DROP")
+        for value in ("192.168.0.84", "192.168.20.1", "100.113.160.27", "203.0.113.5"):
+            with self.subTest(value=value):
+                self.assertEqual(self.verdict(value, "SCHOOL_RMM_SSH"), "DROP")
+                self.assertEqual(self.verdict(value), "DROP")
+        subprocess.run(["bash", "-n"], input=self.firewall.encode(), check=True)
+        with self.assertRaises(ValueError):
+            p.guest_config(b"source", maintenance_host="0.0.0.0/0")
 
     def test_firewall_is_required_before_docker_start_and_script_has_valid_syntax(self):
         dependency = self.files["/etc/systemd/system/docker.service.d/school-rmm-firewall.conf"]
@@ -331,6 +352,66 @@ class ResumeTests(unittest.TestCase):
         with patch("builtins.input", side_effect=AssertionError("Unexpected prompt")), patch.object(p.getpass, "getpass", side_effect=AssertionError("Unexpected password prompt")):
             p.bootstrap_admin()
         self.assertEqual(guest.call_count, 1)
+
+    @patch.object(p, "guest_exec", side_effect=AssertionError("QGA must not be used"))
+    @patch.object(p, "run")
+    @patch.object(p, "api")
+    def test_snapshot_preparation_uses_owned_vm_without_qga_calls(self, api, run, guest):
+        api.return_value = {"name":"school-rmm", "description":self.state["marker"]}
+        p.prepare_ssh_snapshot()
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:3], ["qm", "snapshot", "104"])
+        state = json.loads((self.root/"104.json").read_text())
+        self.assertTrue(state["ssh_snapshot"].startswith("before-ssh-"))
+        self.assertEqual(state["marker"], self.state["marker"])
+        guest.assert_not_called()
+
+    @patch.object(p, "run")
+    @patch.object(p, "api", return_value={"name":"school-rmm", "description":"foreign"})
+    def test_foreign_vm_stops_ssh_snapshot_before_mutation(self, api, run):
+        with self.assertRaises(p.InstallError): p.prepare_ssh_snapshot()
+        run.assert_not_called()
+
+
+class GuestSSHResumeTests(unittest.TestCase):
+    def test_wrong_host_or_implicit_maintenance_access_is_rejected(self):
+        with patch.object(p.os, "geteuid", return_value=0), patch.object(p.socket, "gethostname", return_value="pve"), patch.object(p,"run") as run:
+            with self.assertRaises(p.InstallError):
+                p.resume_inside_guest(p.SCHOOL_LAN, p.MAINTENANCE_HOST)
+            run.assert_not_called()
+        with patch.object(p.os, "geteuid", return_value=0), patch.object(p.socket, "gethostname", return_value="school-rmm"), patch.object(p,"run") as run:
+            with self.assertRaises(p.InstallError):
+                p.resume_inside_guest(p.SCHOOL_LAN, None)
+            run.assert_not_called()
+
+    @patch.object(p.os, "geteuid", return_value=0)
+    @patch.object(p.socket, "gethostname", return_value="school-rmm")
+    @patch.object(p.fcntl, "flock")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch.object(p.Path, "read_text", return_value=json.dumps({"ip":"192.168.18.2", "url":"https://192.168.18.2/", "revision":p.REVISION}))
+    @patch.object(p.Path, "chmod")
+    @patch.object(p, "bootstrap_admin")
+    @patch.object(p, "guest_exec", side_effect=AssertionError("QGA must not be used"))
+    @patch.object(p.subprocess, "run")
+    @patch.object(p, "run")
+    def test_guest_recovery_checks_sources_keeps_ssh_alive_and_uses_local_commands(self, run, child, guest, admin, chmod, read, opened, lock, hostname, uid):
+        run.side_effect = ["source verified", "files backed up", '{"status":"ok"}']
+        p.resume_inside_guest(p.SCHOOL_LAN, p.MAINTENANCE_HOST)
+        self.assertEqual(run.call_count, 3)
+        precheck, repair, https = run.call_args_list
+        compile(precheck.args[0][2], "guest-precheck", "exec")
+        compile(repair.args[0][2], "guest-repair", "exec")
+        payload = json.loads(repair.kwargs["data"])
+        self.assertNotIn("unit", payload)  # The direct SSH invocation streams build logs.
+        paths = {item["path"] for item in payload["files"]}
+        self.assertNotIn("/var/lib/school-rmm/source.tar.gz", paths)
+        self.assertFalse(any("django.key" in path or path.endswith(".env") for path in paths))
+        firewall = next(item["content"] for item in payload["files"] if item["path"].endswith("school-rmm-firewall"))
+        self.assertIn("-A SCHOOL_RMM_SSH -s 192.168.0.250/32 -j ACCEPT", firewall)
+        child.assert_called_once_with(["bash", "/usr/local/sbin/school-rmm-firstboot"], check=True)
+        self.assertIn("--cacert", https.args[0])
+        admin.assert_called_once_with(execute=run)
+        guest.assert_not_called()
 
 
 class BootDiagnosticsTests(unittest.TestCase):

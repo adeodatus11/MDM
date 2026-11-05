@@ -23,8 +23,13 @@ utworzono osobną VM 104; początkowe odczyty przez agenta QEMU działały, ale 
 na błędnym sprawdzeniu podsieci po wypakowaniu aplikacji. Panel nie jest jeszcze
 potwierdzony jako uruchomiony. Naprawę bez odtwarzania dysku opisuje
 [tryb wznowienia](PROVISION-PVE.md#wznowienie-zatrzymanej-instalacji).
-Najnowsza próba wznowienia zwróciła timeout guest-exec przed snapshotem i zmianą zapory;
-wymaga odczytu stanu agenta. Operator potwierdził teraz dostęp kluczem przez Tailscale:
+Próba wznowienia zwróciła timeout guest-exec przed snapshotem i zmianą zapory.
+Restart agenta przywrócił active i ping, lecz guest-exec nadal zwraca timeout.
+Operator potwierdził działające SSH do rmmadmin w VM przez pve jako ProxyJump.
+Do naprawy używać [trybu SSH](PROVISION-PVE.md#preferowana-naprawa-przez-działające-ssh):
+snapshot oznaczonej VM na pve, a następnie `--guest-resume` wewnątrz VM.
+Reguła serwisowa dopuszcza SSH/22 z pve 192.168.0.250/32, bez wyjątku dla panelu HTTPS.
+Operator potwierdził także dostęp kluczem przez Tailscale:
 `ssh root@proxmox-pve.taila141c0.ts.net`. Ta ścieżka działa z Maca również poza LAN.
 Sesja chmurowa nadal nie ma skonfigurowanego VPN ani klucza SSH. Dostęp do panelu
 School RMM pozostaje wyłącznie w szkolnym LAN. Zasady utrzymania Tailscale, DNS

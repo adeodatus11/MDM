@@ -6,7 +6,12 @@ osobną VM 104 school-rmm (2 vCPU, 2 GiB RAM, 40 GiB local-zfs) przez instalator
 z repozytorium. VM otrzymała 192.168.18.2; instalacja panelu nie jest ukończona.
 Pierwszy start zatrzymał się na błędnym sprawdzeniu podsieci, a próba wznowienia
 zakończyła się timeoutem guest-exec przed potwierdzeniem odczytu stanu gościa.
-Nie odtwarzać VM 104; używać trybu wznowienia po diagnostyce agenta QEMU.
+Operator potwierdził następnie SSH do rmmadmin@192.168.18.2 przez host pve jako
+ProxyJump. Restart agenta przywrócił jego stan active i ping, lecz guest-exec
+ponownie zwróciło timeout. Preferować naprawę przez działające SSH:
+`--snapshot-only` na pve, następnie `--guest-resume` wewnątrz VM; szczegóły
+w [instrukcji instalatora](../deploy/PROVISION-PVE.md#preferowana-naprawa-przez-działające-ssh).
+Nie odtwarzać VM 104.
 
 Chronione zasoby: VM 100 GENAI, VM 101 cdu i VM 103 ai-server (192.168.0.84).
 Nie modyfikować tych VM ani /srv/school-ai i /srv/school-ai/stack/compose.yaml.
@@ -32,6 +37,8 @@ ssh root@proxmox-pve.taila141c0.ts.net
 
 Ten dostęp służy utrzymaniu infrastruktury. School RMM pozostaje dostępny wyłącznie
 z LAN 192.168.16.0/22. Nie publikować go przez Serve, Funnel ani tunel SSH.
+Tryb naprawy dopuszcza jawnie serwisowe SSH do VM z hosta pve 192.168.0.250/32,
+bez przyznawania temu adresowi dostępu do HTTPS panelu. To osobna reguła portu 22.
 Zmiana sieci Maca nie zmienia docelowego --school-lan. Timeout guest-exec dotyczy
 komunikacji pve z gościem przez agenta QEMU; wolniejszy relay nie potwierdza jego
 przyczyny. Najpierw odczytać stan VM, guest-ping i proste guest-exec, bez resetu VM.

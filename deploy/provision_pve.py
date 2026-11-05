@@ -34,6 +34,7 @@ STATE_DIR = Path("/var/lib/vz/school-rmm-install")
 SNIPPET_ROOT = Path("/var/lib/vz/school-rmm-104-snippets")
 GIB = 1024 ** 3
 SCHOOL_LAN = "192.168.16.0/22"
+MAINTENANCE_HOST = "192.168.0.250"
 
 # Runs inside the guest. Reusing an extracted archive must never overwrite local
 # settings, keys, data, or edited source files.
@@ -185,11 +186,13 @@ def guest_exec(command, *, data=None, timeout=60):
     return result.get("out-data", "")
 
 
-def guest_config(source, public_keys=None, school_lan=SCHOOL_LAN):
+def guest_config(source, public_keys=None, school_lan=SCHOOL_LAN, maintenance_host=None):
     # These files contain public source code/settings only. Passwords are entered later.
     if public_keys is not None and (not isinstance(public_keys, list) or any(not isinstance(key, str) for key in public_keys)):
         raise ValueError("Publiczne klucze SSH muszą być listą wpisów.")
     school_lan = school_network(school_lan)
+    if maintenance_host not in (None, MAINTENANCE_HOST):
+        raise ValueError("Dostęp serwisowy SSH jest ograniczony do wskazanego hosta pve.")
     firewall = r'''#!/bin/bash
 set -euo pipefail
 iface=$(ip -4 route show default | awk 'NR==1 {print $5}')
@@ -199,14 +202,22 @@ iptables -w -n -L DOCKER-USER >/dev/null 2>&1 || iptables -w -N DOCKER-USER
 iptables-restore --wait --noflush <<'RMM_IPV4'
 *filter
 :SCHOOL_RMM_WEB - [0:0]
+:SCHOOL_RMM_SSH - [0:0]
 -A SCHOOL_RMM_WEB -s @SCHOOL_LAN@ -j RETURN
 -A SCHOOL_RMM_WEB -j DROP
+-A SCHOOL_RMM_SSH -s @SCHOOL_LAN@ -j ACCEPT
+@MAINTENANCE_RULE@
+-A SCHOOL_RMM_SSH -j DROP
 COMMIT
 RMM_IPV4
 iptables -w -C DOCKER-USER -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB 2>/dev/null || \
     iptables -w -I DOCKER-USER 1 -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB
-iptables -w -C INPUT -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB 2>/dev/null || \
-    iptables -w -I INPUT 1 -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB
+iptables -w -C INPUT -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_SSH 2>/dev/null || \
+    iptables -w -I INPUT 1 -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_SSH
+# Remove the previous installer's SSH hook after the replacement is in place.
+while iptables -w -C INPUT -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB 2>/dev/null; do
+    iptables -w -D INPUT -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB
+done
 # This deployment uses an IPv4-only LAN. Do not leave an IPv6 management path.
 if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 0 ]; then
     ip6tables-restore --wait --noflush <<'RMM_IPV6'
@@ -224,7 +235,8 @@ RMM_IPV6
             ip6tables -w -I DOCKER-USER 1 -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB6
     fi
 fi
-'''.replace("@SCHOOL_LAN@", school_lan)
+'''.replace("@SCHOOL_LAN@", school_lan).replace("@MAINTENANCE_RULE@",
+    f"-A SCHOOL_RMM_SSH -s {maintenance_host}/32 -j ACCEPT" if maintenance_host else "")
     unit = '''[Unit]
 Description=School RMM HTTPS access restriction
 Wants=network-online.target
@@ -251,7 +263,7 @@ flock -n 9 || { echo 'Instalacja już trwa w tej VM.'; exit 1; }
 systemctl daemon-reload
 systemctl enable --now school-rmm-firewall.service
 /usr/local/sbin/school-rmm-firewall
-systemctl enable --now qemu-guest-agent docker
+@START_SERVICES@
 iface=$(ip -4 route show default | awk 'NR==1 {print $5}')
 address=$(ip -4 -o addr show dev "$iface" scope global | awk 'NR==1 {split($4,a,"/"); print a[1]}')
 python3 - "$address" <<'PY_NETWORK'
@@ -267,8 +279,18 @@ python3 deploy/init_deployment.py --hostname "$address" --bind-address "$address
 export DOCKER_BUILDKIT=1
 docker compose -f deploy/compose.yaml build
 docker compose -f deploy/compose.yaml up -d --no-build --wait --wait-timeout 180
-docker compose -f deploy/compose.yaml cp proxy:/data/caddy/pki/authorities/local/root.crt ./school-rmm-ca.crt
-curl --fail --silent --show-error --noproxy '*' --cacert school-rmm-ca.crt "https://$address/healthz/"
+# A running Caddy container may still be generating its CA on its first start.
+ca_ready=0
+for attempt in {1..30}; do
+    if docker compose -f deploy/compose.yaml cp proxy:/data/caddy/pki/authorities/local/root.crt ./school-rmm-ca.crt; then
+        ca_ready=1
+        break
+    fi
+    sleep 1
+done
+test "$ca_ready" = 1
+curl --fail --silent --show-error --noproxy '*' --cacert school-rmm-ca.crt \
+    --retry 5 --retry-connrefused --retry-delay 1 --retry-max-time 60 --max-time 15 "https://$address/healthz/"
 python3 - "$address" <<'PY_STATUS'
 import json, sys
 from pathlib import Path
@@ -276,7 +298,8 @@ Path('/var/lib/school-rmm-install.ready').write_text(json.dumps({
     'ip': sys.argv[1], 'url': 'https://' + sys.argv[1] + '/', 'revision': '@REVISION@'
 }))
 PY_STATUS
-'''.replace("@SOURCE_SHA@", SOURCE_SHA256).replace("@REVISION@", REVISION).replace("@SCHOOL_LAN@", school_lan).replace("@SOURCE_SETUP@", shlex.quote(SOURCE_SETUP))
+'''.replace("@SOURCE_SHA@", SOURCE_SHA256).replace("@REVISION@", REVISION).replace("@SCHOOL_LAN@", school_lan).replace("@SOURCE_SETUP@", shlex.quote(SOURCE_SETUP)).replace(
+    "@START_SERVICES@", "systemctl enable --now docker" if maintenance_host else "systemctl enable --now qemu-guest-agent docker")
     return {
         "hostname": "school-rmm", "manage_etc_hosts": True,
         "disable_root": True, "ssh_pwauth": False,
@@ -348,13 +371,8 @@ def save_state(state):
     temporary.replace(STATE_DIR / "104.json")
 
 
-def resume_vm(state, school_lan):
-    """Repair only our VM, after a read-only check and a snapshot of its disk."""
-    if owned_state() != state:
-        raise InstallError("Stan instalacji zmienił się; przerwano wznowienie.")
-    if api(f"/nodes/{NODE}/qemu/{VMID}/status/current").get("status") != "running":
-        raise InstallError("VM 104 musi działać, aby odczytać stan przez agenta QEMU.")
-    check = r'''
+def resume_check_code():
+    return r'''
 import ipaddress, json, subprocess, sys
 from pathlib import Path
 d = json.load(sys.stdin)
@@ -380,6 +398,15 @@ if not Path('/opt/school-rmm').is_dir():
 subprocess.run([sys.executable, '-c', d['source_setup'], '/var/lib/school-rmm/source.tar.gz', '/opt/school-rmm', d['source_sha']], check=True)
 print('Adres VM:', address, 'Dozwolony LAN:', network)
 '''
+
+
+def resume_vm(state, school_lan):
+    """Repair only our VM, after a read-only check and a snapshot of its disk."""
+    if owned_state() != state:
+        raise InstallError("Stan instalacji zmienił się; przerwano wznowienie.")
+    if api(f"/nodes/{NODE}/qemu/{VMID}/status/current").get("status") != "running":
+        raise InstallError("VM 104 musi działać, aby odczytać stan przez agenta QEMU.")
+    check = resume_check_code()
     print(guest_exec(["python3", "-c", check], data=json.dumps({
         "school_lan": school_lan, "resume_unit": state.get("resume_unit"),
         "source_setup": SOURCE_SETUP, "source_sha": SOURCE_SHA256,
@@ -390,7 +417,17 @@ print('Adres VM:', address, 'Dozwolony LAN:', network)
          "--description", "Stan przed poprawką LAN School RMM"], timeout=180)
     files = [item for item in guest_config(b"", school_lan=school_lan)["write_files"]
              if item["path"] != "/var/lib/school-rmm/source.tar.gz"]
-    repair = r'''
+    repair = resume_repair_code()
+    state.update({"school_lan": school_lan, "resume_unit": "school-rmm-resume-" + attempt + ".service"})
+    save_state(state)
+    print(guest_exec(["python3", "-c", repair], data=json.dumps({
+        "files": files, "attempt": attempt, "unit": state["resume_unit"],
+    }).encode(), timeout=90).strip(), flush=True)
+    return state
+
+
+def resume_repair_code():
+    return r'''
 import json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 d = json.load(sys.stdin)
@@ -418,16 +455,11 @@ subprocess.run(['systemctl', 'daemon-reload'], check=True)
 ready = Path('/var/lib/school-rmm-install.ready')
 if ready.exists():
     ready.rename(backup / 'previous-ready.json')
-subprocess.run(['systemd-run', '--no-block', '--unit', d['unit'], '--property=Type=oneshot',
-                '--property=RemainAfterExit=yes', '/usr/local/sbin/school-rmm-firstboot'], check=True)
-print('Wznowiono instalację. Kopia plików instalatora:', backup)
+if d.get('unit'):
+    subprocess.run(['systemd-run', '--no-block', '--unit', d['unit'], '--property=Type=oneshot',
+                    '--property=RemainAfterExit=yes', '/usr/local/sbin/school-rmm-firstboot'], check=True)
+print('Przygotowano wznowienie. Kopia plików instalatora:', backup)
 '''
-    state.update({"school_lan": school_lan, "resume_unit": "school-rmm-resume-" + attempt + ".service"})
-    save_state(state)
-    print(guest_exec(["python3", "-c", repair], data=json.dumps({
-        "files": files, "attempt": attempt, "unit": state["resume_unit"],
-    }).encode(), timeout=90).strip(), flush=True)
-    return state
 
 
 def installation_failure(resume_unit=None):
@@ -478,8 +510,9 @@ def wait_ready(school_lan=SCHOOL_LAN, resume_unit=None):
     raise InstallError("Upłynął czas instalacji. VM zachowano. Odczytaj /var/log/school-rmm-install.log przez qm guest exec 104.")
 
 
-def bootstrap_admin():
-    existing = guest_exec(["docker", "compose", "-f", "/opt/school-rmm/deploy/compose.yaml", "exec", "-T", "app",
+def bootstrap_admin(execute=None):
+    execute = execute or guest_exec
+    existing = execute(["docker", "compose", "-f", "/opt/school-rmm/deploy/compose.yaml", "exec", "-T", "app",
                           "python", "manage.py", "shell", "-c",
                           "from django.contrib.auth.models import User; print('RMM_ADMIN_EXISTS' if User.objects.filter(is_superuser=True,is_active=True).exists() else 'RMM_ADMIN_NEEDED')"], timeout=60)
     if "RMM_ADMIN_EXISTS" in existing.splitlines():
@@ -500,10 +533,63 @@ def bootstrap_admin():
         "validate_password(d['password'], u); u.set_password(d['password']); u.full_clean(); u.save(); "
         "print('Konto utworzone. Pierwsze logowanie wymaga skonfigurowania TOTP.')"
     )
-    output = guest_exec(["docker", "compose", "-f", "/opt/school-rmm/deploy/compose.yaml", "exec", "-T", "app",
+    output = execute(["docker", "compose", "-f", "/opt/school-rmm/deploy/compose.yaml", "exec", "-T", "app",
                         "python", "manage.py", "shell", "-c", code],
                        data=json.dumps({"username": username, "password": password}).encode(), timeout=90)
     print(output.strip())
+
+
+def prepare_ssh_snapshot():
+    state = owned_state()
+    snapshot = "before-ssh-" + uuid.uuid4().hex[:12]
+    print("Sprawdzono znacznik VM 104. Tworzę snapshot przed wznowieniem przez SSH...", flush=True)
+    run(["qm", "snapshot", str(VMID), snapshot, "--description", "Przed wznowieniem School RMM przez SSH"], timeout=180)
+    state["ssh_snapshot"] = snapshot
+    save_state(state)
+    print("Snapshot VM 104 gotowy: " + snapshot, flush=True)
+
+
+def resume_inside_guest(school_lan, maintenance_host):
+    """Run via the owner's verified SSH connection, without any QGA calls."""
+    if os.geteuid() != 0 or socket.gethostname().split(".")[0] != "school-rmm":
+        raise InstallError("Ten tryb wymaga sudo na istniejącej VM school-rmm, nie na hoście pve.")
+    school_lan = school_network(school_lan)
+    if maintenance_host != MAINTENANCE_HOST:
+        raise InstallError("Podaj jawnie host serwisowy SSH: --maintenance-host 192.168.0.250.")
+    os.umask(0o077)
+    with open("/run/lock/school-rmm-ssh-resume.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Keep an existing first-boot job from racing the source check/file update.
+        with open("/run/lock/school-rmm-firstboot.lock", "a") as boot_lock:
+            fcntl.flock(boot_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print("Sprawdzam cloud-init, adres LAN oraz niezmienione źródła aplikacji...", flush=True)
+            print(run(["python3", "-c", resume_check_code()], data=json.dumps({
+                "school_lan": school_lan, "source_setup": SOURCE_SETUP, "source_sha": SOURCE_SHA256,
+            }).encode(), timeout=60).strip(), flush=True)
+            files = [item for item in guest_config(b"", school_lan=school_lan, maintenance_host=maintenance_host)["write_files"]
+                     if item["path"] != "/var/lib/school-rmm/source.tar.gz"]
+            print(run(["python3", "-c", resume_repair_code()], data=json.dumps({
+                "files": files, "attempt": "ssh-" + uuid.uuid4().hex[:12],
+            }).encode(), timeout=90).strip(), flush=True)
+        print("Buduję i uruchamiam aplikację. Logi będą wyświetlane w tym terminalu...", flush=True)
+        subprocess.run(["bash", "/usr/local/sbin/school-rmm-firstboot"], check=True)
+        status = json.loads(Path("/var/lib/school-rmm-install.ready").read_text())
+        if (not valid_address(status["ip"], school_lan) or status.get("revision") != REVISION
+                or status.get("url") != "https://" + status["ip"] + "/"):
+            raise InstallError("Niepoprawny raport gotowości. Zachowano dane aplikacji.")
+        ca_path = Path("/opt/school-rmm/school-rmm-ca.crt")
+        response = run(["curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
+                        "--max-time", "15", "--cacert", str(ca_path), status["url"] + "healthz/"], timeout=30)
+        if json.loads(response).get("status") != "ok":
+            raise InstallError("HTTPS nie potwierdził gotowości aplikacji.")
+        # This is the public certificate only, so the maintenance user can SCP it.
+        ca_path.chmod(0o644)
+        bootstrap_admin(execute=run)
+        print("\nPanel uruchomiony w VM: " + status["url"])
+        print("Dostęp do panelu: wyłącznie " + school_lan)
+        print("SSH serwisowe: LAN oraz host pve " + maintenance_host + "/32; bez dostępu tego hosta do panelu.")
+        print("Publiczny certyfikat CA do pobrania przez SCP z VM: " + str(ca_path))
+        print("Pierwsze logowanie wymaga skonfigurowania TOTP. Integracja agentów Windows pozostaje osobnym etapem.")
 
 
 def main():
@@ -511,9 +597,18 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--finish", action="store_true", help="Finish this installer's existing VM; never recreates disks.")
     mode.add_argument("--resume", action="store_true", help="Resume a failed installation on the owned VM 104, preserving disks and data.")
+    mode.add_argument("--snapshot-only", action="store_true", help="Verify owned VM 104 and snapshot it before SSH recovery; no guest-exec calls.")
+    mode.add_argument("--guest-resume", action="store_true", help="Run with sudo inside school-rmm through SSH; no QGA dependency.")
     parser.add_argument("--school-lan", required=True, type=school_network,
                         help="Explicit school LAN CIDR, e.g. 192.168.16.0/22. Do not infer it from the pve address.")
+    parser.add_argument("--maintenance-host", choices=[MAINTENANCE_HOST],
+                        help="Explicit SSH-only maintenance exception for pve, without HTTPS access.")
     args = parser.parse_args()
+    if args.guest_resume:
+        resume_inside_guest(args.school_lan, args.maintenance_host)
+        return
+    if args.maintenance_host:
+        parser.error("--maintenance-host jest przeznaczony wyłącznie dla --guest-resume.")
     if os.geteuid() != 0 or socket.gethostname().split(".")[0] != NODE:
         raise InstallError("Uruchom na hoście pve w istniejącej sesji root@pve.")
     for binary in ("qm", "pvesh", "pvesm", "qemu-img", "curl"):
@@ -522,6 +617,9 @@ def main():
     os.umask(0o077)
     lock = open("/run/lock/school-rmm-provision-104.lock", "a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if args.snapshot_only:
+        prepare_ssh_snapshot()
+        return
     if "--pass-stdin" not in run(["qm", "help", "guest", "exec"], timeout=30):
         raise InstallError("Zainstalowany qm nie deklaruje --pass-stdin; przerwano przed zmianami.")
     if args.finish or args.resume:

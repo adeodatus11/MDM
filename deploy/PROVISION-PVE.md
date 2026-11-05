@@ -33,8 +33,9 @@ nie określa sieci klientów DHCP. Pierwszy instalator zatrzymał się po wypako
 - Przenosi wyłącznie publiczne wpisy z /root/.ssh/authorized_keys do konta utrzymaniowego
   rmmadmin w nowej VM; prywatne klucze pozostają na swoich komputerach. Gdy pliku nie ma,
   obsługa jest dostępna przez agenta QEMU. Logowanie hasłem i SSH root w VM są wyłączone.
-- Uruchamia HTTPS i MFA; panel i SSH nowej VM przyjmują wyłącznie klientów
+- Uruchamia HTTPS i MFA; panel nowej VM przyjmuje wyłącznie klientów
   z jawnie wskazanej sieci szkolnej `--school-lan` (tutaj 192.168.16.0/22).
+  SSH domyślnie również ogranicza do LAN. Jawny wariant naprawy przez SSH opisano poniżej.
   Nie dopuszcza automatycznie klienta SSH spoza LAN,
   adresów VPN ani publicznych IP. Zarządzanie po IPv6 jest zablokowane w tym profilu IPv4.
 - Zapora jest wymagana przed startem Dockera i jest odtwarzana przy jego restarcie.
@@ -74,6 +75,41 @@ qm guest exec 104 -- /usr/bin/tail -n 80 /var/log/school-rmm-install.log
 ```
 
 ### Wznowienie zatrzymanej instalacji
+
+#### Preferowana naprawa przez działające SSH
+
+Operator potwierdził działający dostęp:
+`ssh -J root@proxmox-pve.taila141c0.ts.net rmmadmin@192.168.18.2`.
+Restart qemu-guest-agent przywrócił ping, lecz następne guest-exec ponownie
+zakończyło się timeoutem. Nie zakładać, że kolejny restart agenta rozwiąże problem.
+Do dokończenia instalacji użyć nowego pliku instalatora przez SSH:
+
+1. Na pve uruchomić zweryfikowany instalator z
+   `--snapshot-only --school-lan 192.168.16.0/22`. Sprawdza znacznik właściciela
+   istniejącej VM 104 i tworzy snapshot bez używania guest-exec.
+2. Po powodzeniu pierwszego kroku pobrać i sprawdzić tę samą wersję instalatora
+   w VM, a następnie uruchomić ją przez `sudo -n python3` z opcjami
+   `--guest-resume --school-lan 192.168.16.0/22 --maintenance-host 192.168.0.250`.
+
+Tryb gościa sprawdza root i hostname school-rmm, blokuje równoległą instalację,
+sprawdza cloud-init, LAN i źródła względem przypiętego archiwum, zachowuje kopie
+plików instalatora oraz istniejącą konfigurację, klucz i dane. Budowę kontenerów
+wykonuje lokalnie i wyświetla logi w terminalu. HTTPS i założenie konta działają
+bez QGA. Pierwszy start czeka na wygenerowanie CA Caddy z ograniczonym ponawianiem
+wyłącznie odczytu certyfikatu i sprawdzenia HTTPS.
+
+Panel i SSH mają odrębne łańcuchy zapory. Jawny `--maintenance-host` dopuszcza
+**wyłącznie SSH/22 z 192.168.0.250/32**, żeby aktualizacja zapory nie odcięła
+połączenia serwisowego przez Proxmox. HTTPS nie ma tego wyjątku i nadal wymaga
+adresu źródłowego z 192.168.16.0/22. Nie dodaje adresów VPN ani automatycznego
+wyjątku dla aktualnego klienta. Reguły pozostają odtwarzane przed startem Dockera.
+
+Po sukcesie publiczny certyfikat jest w VM jako `/opt/school-rmm/school-rmm-ca.crt`
+z prawami do odczytu przez rmmadmin. Można go pobrać na Maca przez SCP z opcją `-J`.
+Prywatny klucz CA i klucz Django nie są eksportowane. Konto administratora i MFA
+działają tak samo jak w pierwotnej ścieżce. Otwarcie panelu nadal wymaga szkolnego LAN.
+
+#### Wznowienie przez sprawnego agenta QEMU
 
 Z istniejącego terminala `root@pve`, po pobraniu i sprawdzeniu nowego instalatora:
 
