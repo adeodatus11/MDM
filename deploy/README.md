@@ -6,7 +6,9 @@ Profil startowy tego instalatora to 2 vCPU, 2 GiB RAM i 40 GiB dysku;
 ponownie sprawdza zasoby i chroni istniejące VM oraz kontenery.
 
 Pakiet uruchamia panel School RMM, Gunicorn i Caddy z HTTPS oraz obowiązkowym MFA.
-Docelowy dostęp jest wyłącznie z sieci szkolnej 192.168.0.0/24. Instalator VM 104
+Docelowy dostęp jest wyłącznie z sieci szkolnej wskazanej przez `--school-lan`.
+Odczyt z Maca potwierdził `192.168.16.0/22`, obejmujące VM `192.168.18.2`.
+Adres zarządzania pve `192.168.0.250` nie określa sieci klientów. Instalator VM 104
 wdraża odpowiednią zaporę; sam plik Compose nie zastępuje tej zapory. Nie udostępniać
 panelu przez Internet, VPN dla administratorów zewnętrznych ani publiczny tunel.
 Nie instaluje jeszcze MeshCentral ani nie wykonuje zadań na komputerach Windows.
@@ -16,7 +18,11 @@ Kontenery aplikacji uruchamia się wewnątrz osobnej VM Linux, nie na hoście Pr
 
 Węzeł wskazany przez właściciela: `pve`, API `https://192.168.0.250:8006`.
 Próba odczytu API zatrzymała się na proxy środowiska (CONNECT 403), przed
-połączeniem z Proxmox. Nie utworzono VM, nie zmieniono sieci ani istniejących maszyn.
+połączeniem z Proxmox. Następnie właściciel uruchomił instalator przez swoje SSH:
+utworzono osobną VM 104, działa agent QEMU, ale pierwsze uruchomienie zatrzymało się
+na błędnym sprawdzeniu podsieci po wypakowaniu aplikacji. Panel nie jest jeszcze
+potwierdzony jako uruchomiony. Naprawę bez odtwarzania dysku opisuje
+[tryb wznowienia](PROVISION-PVE.md#wznowienie-zatrzymanej-instalacji).
 Użytkownik wskazał SSH root@192.168.0.250:22 z istniejącym kluczem, jednak ten
 klucz ani agent SSH nie są dostępne w tej sesji. Instalację wykonuje właściciel
 z lokalnej sieci przez istniejący terminal SSH. Połączenie z chmury do szkolnej

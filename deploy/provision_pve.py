@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision only a new School RMM VM on pve. Run from the owner's SSH terminal."""
+"""Create or resume the owned School RMM VM on pve via the owner's SSH terminal."""
 import argparse
 import base64
 import fcntl
@@ -10,14 +10,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 import uuid
 
 VMID = 104
@@ -34,7 +33,73 @@ IMAGE_BASE = "https://cloud-images.ubuntu.com/noble/current/"
 STATE_DIR = Path("/var/lib/vz/school-rmm-install")
 SNIPPET_ROOT = Path("/var/lib/vz/school-rmm-104-snippets")
 GIB = 1024 ** 3
-SCHOOL_LAN = "192.168.0.0/24"
+SCHOOL_LAN = "192.168.16.0/22"
+
+# Runs inside the guest. Reusing an extracted archive must never overwrite local
+# settings, keys, data, or edited source files.
+SOURCE_SETUP = r'''
+import hashlib, shutil, sys, tarfile, tempfile
+from pathlib import Path, PurePosixPath
+archive, root, expected = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+    raise SystemExit('Archiwum aplikacji nie przeszło kontroli SHA256.')
+if root.is_symlink() or (root.exists() and not root.is_dir()):
+    raise SystemExit('Katalog aplikacji nie jest zwykłym katalogiem.')
+with tarfile.open(archive, 'r:gz') as source:
+    entries = []
+    for member in source.getmembers():
+        parts = PurePosixPath(member.name).parts
+        if member.name.startswith('/') or '..' in parts or not (member.isdir() or member.isfile()):
+            raise SystemExit('Nieobsługiwany wpis w archiwum aplikacji.')
+        if len(parts) > 1:
+            entries.append((member, Path(*parts[1:])))
+    if not any(str(name) == 'manage.py' for member, name in entries if member.isfile()):
+        raise SystemExit('Brak manage.py w zweryfikowanym archiwum.')
+    if root.exists():
+        for member, name in entries:
+            target = root / name
+            if any(part.is_symlink() for part in [target, *target.parents] if part != root.parent):
+                raise SystemExit('Dowiązanie w katalogu aplikacji: ' + str(name))
+            if member.isdir():
+                if not target.is_dir():
+                    raise SystemExit('Brak katalogu źródłowego: ' + str(name))
+            elif not target.is_file() or hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(source.extractfile(member).read()).digest():
+                raise SystemExit('Zmieniony lub niepełny plik: ' + str(name) + '; zachowano dane, wymagane sprawdzenie.')
+    else:
+        temporary = Path(tempfile.mkdtemp(prefix='.school-rmm-source-', dir=root.parent))
+        try:
+            for member, name in entries:
+                target = temporary / name
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open('xb') as output, source.extractfile(member) as content:
+                        shutil.copyfileobj(content, output)
+                    target.chmod(member.mode & 0o777)
+            temporary.chmod(0o755)
+            temporary.rename(root)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+print('Zweryfikowano źródła; zachowano lokalne ustawienia i dane.')
+'''
+
+
+def school_network(value):
+    try:
+        network = ipaddress.IPv4Network(value, strict=True)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('Podaj poprawną sieć IPv4 w zapisie CIDR.') from error
+    private = (ipaddress.IPv4Network(block) for block in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+    if not any(network.subnet_of(block) for block in private) or network.prefixlen > 30:
+        raise argparse.ArgumentTypeError('Wymagana jest prywatna sieć LAN RFC1918 z adresami hostów.')
+    return str(network)
+
+
+def valid_address(value, school_lan):
+    address, network = ipaddress.IPv4Address(value), ipaddress.IPv4Network(school_lan)
+    return address in network and address not in (network.network_address, network.broadcast_address)
 
 
 class InstallError(RuntimeError):
@@ -120,10 +185,11 @@ def guest_exec(command, *, data=None, timeout=60):
     return result.get("out-data", "")
 
 
-def guest_config(source, public_keys=None):
+def guest_config(source, public_keys=None, school_lan=SCHOOL_LAN):
     # These files contain public source code/settings only. Passwords are entered later.
     if public_keys is not None and (not isinstance(public_keys, list) or any(not isinstance(key, str) for key in public_keys)):
         raise ValueError("Publiczne klucze SSH muszą być listą wpisów.")
+    school_lan = school_network(school_lan)
     firewall = r'''#!/bin/bash
 set -euo pipefail
 iface=$(ip -4 route show default | awk 'NR==1 {print $5}')
@@ -158,7 +224,7 @@ RMM_IPV6
             ip6tables -w -I DOCKER-USER 1 -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB6
     fi
 fi
-'''.replace("@SCHOOL_LAN@", SCHOOL_LAN)
+'''.replace("@SCHOOL_LAN@", school_lan)
     unit = '''[Unit]
 Description=School RMM HTTPS access restriction
 Wants=network-online.target
@@ -180,16 +246,22 @@ After=school-rmm-firewall.service
 set -euo pipefail
 umask 077
 exec > >(tee -a /var/log/school-rmm-install.log) 2>&1
+exec 9>/run/lock/school-rmm-firstboot.lock
+flock -n 9 || { echo 'Instalacja już trwa w tej VM.'; exit 1; }
 systemctl daemon-reload
 systemctl enable --now school-rmm-firewall.service
+/usr/local/sbin/school-rmm-firewall
 systemctl enable --now qemu-guest-agent docker
-printf '%s  %s\n' '@SOURCE_SHA@' /var/lib/school-rmm/source.tar.gz | sha256sum --check -
-test ! -e /opt/school-rmm
-install -d -m 0755 /opt/school-rmm
-tar --extract --gzip --file /var/lib/school-rmm/source.tar.gz --strip-components=1 --directory /opt/school-rmm
 iface=$(ip -4 route show default | awk 'NR==1 {print $5}')
 address=$(ip -4 -o addr show dev "$iface" scope global | awk 'NR==1 {split($4,a,"/"); print a[1]}')
-case "$address" in 192.168.0.*) ;; *) printf 'Nieoczekiwana sieć DHCP: %s\n' "$address"; exit 1;; esac
+python3 - "$address" <<'PY_NETWORK'
+import ipaddress, sys
+network = ipaddress.IPv4Network('@SCHOOL_LAN@')
+address = ipaddress.IPv4Address(sys.argv[1])
+if address not in network or address in (network.network_address, network.broadcast_address):
+    raise SystemExit('Adres DHCP poza dozwolonym LAN: ' + str(address))
+PY_NETWORK
+python3 -c @SOURCE_SETUP@ /var/lib/school-rmm/source.tar.gz /opt/school-rmm @SOURCE_SHA@
 cd /opt/school-rmm
 python3 deploy/init_deployment.py --hostname "$address" --bind-address "$address"
 export DOCKER_BUILDKIT=1
@@ -204,7 +276,7 @@ Path('/var/lib/school-rmm-install.ready').write_text(json.dumps({
     'ip': sys.argv[1], 'url': 'https://' + sys.argv[1] + '/', 'revision': '@REVISION@'
 }))
 PY_STATUS
-'''.replace("@SOURCE_SHA@", SOURCE_SHA256).replace("@REVISION@", REVISION)
+'''.replace("@SOURCE_SHA@", SOURCE_SHA256).replace("@REVISION@", REVISION).replace("@SCHOOL_LAN@", school_lan).replace("@SOURCE_SETUP@", shlex.quote(SOURCE_SETUP))
     return {
         "hostname": "school-rmm", "manage_etc_hosts": True,
         "disable_root": True, "ssh_pwauth": False,
@@ -224,7 +296,7 @@ PY_STATUS
     }
 
 
-def create_vm(work, source, image, public_keys=None):
+def create_vm(work, source, image, public_keys=None, school_lan=SCHOOL_LAN):
     snippet_root = SNIPPET_ROOT
     if snippet_root.exists() or SNIPPET_STORAGE in {item["storage"] for item in api("/storage")}:
         raise InstallError("Miejsce na konfigurację cloud-init już istnieje. Przerwano bez nadpisywania.")
@@ -232,7 +304,7 @@ def create_vm(work, source, image, public_keys=None):
     (snippet_root / "snippets").mkdir(mode=0o755)
     user_data = snippet_root / "snippets" / "school-rmm-104.yaml"
     with user_data.open("x") as stream:
-        stream.write("#cloud-config\n" + json.dumps(guest_config(source, public_keys), indent=2))
+        stream.write("#cloud-config\n" + json.dumps(guest_config(source, public_keys, school_lan), indent=2))
     user_data.chmod(0o644)
     run(["pvesm", "add", "dir", SNIPPET_STORAGE, "--path", str(snippet_root), "--content", "snippets", "--nodes", NODE])
     marker = "school-rmm-installer:" + uuid.uuid4().hex
@@ -240,7 +312,7 @@ def create_vm(work, source, image, public_keys=None):
          "--cores", "2", "--cpu", "host", "--ostype", "l26", "--scsihw", "virtio-scsi-single",
          "--net0", f"virtio,bridge={BRIDGE}", "--agent", "enabled=1", "--onboot", "1",
          "--serial0", "socket", "--vga", "serial0", "--tags", "school-rmm", "--description", marker])
-    state = {"marker": marker, "vmid": VMID, "work": str(work)}
+    state = {"marker": marker, "vmid": VMID, "work": str(work), "school_lan": school_lan}
     with (STATE_DIR / "104.json").open("x") as stream:
         json.dump(state, stream)
     print("Importuję zweryfikowany obraz do nowej VM 104...", flush=True)
@@ -257,23 +329,162 @@ def create_vm(work, source, image, public_keys=None):
     return state
 
 
-def wait_ready():
+def owned_state():
+    state = json.loads((STATE_DIR / "104.json").read_text())
+    config = api(f"/nodes/{NODE}/qemu/{VMID}/config")
+    if (state.get("vmid") != VMID or not re.fullmatch(r"school-rmm-installer:[0-9a-f]{32}", state.get("marker", ""))
+            or config.get("description") != state["marker"] or config.get("name") != "school-rmm"):
+        raise InstallError("VM 104 nie jest jednoznacznie własnością tego instalatora.")
+    work = Path(state["work"])
+    if work.is_symlink() or not work.is_dir() or work.parent.resolve() != STATE_DIR.resolve():
+        raise InstallError("Nieprawidłowy katalog stanu istniejącej instalacji.")
+    return state
+
+
+def save_state(state):
+    temporary = STATE_DIR / ("104.json." + uuid.uuid4().hex)
+    with temporary.open("x") as stream:
+        json.dump(state, stream)
+    temporary.replace(STATE_DIR / "104.json")
+
+
+def resume_vm(state, school_lan):
+    """Repair only our VM, after a read-only check and a snapshot of its disk."""
+    if owned_state() != state:
+        raise InstallError("Stan instalacji zmienił się; przerwano wznowienie.")
+    if api(f"/nodes/{NODE}/qemu/{VMID}/status/current").get("status") != "running":
+        raise InstallError("VM 104 musi działać, aby odczytać stan przez agenta QEMU.")
+    check = r'''
+import ipaddress, json, subprocess, sys
+from pathlib import Path
+d = json.load(sys.stdin)
+p = subprocess.run(['cloud-init', 'status', '--format', 'json'], capture_output=True, text=True)
+try:
+    status = json.loads(p.stdout)['status']
+except (ValueError, KeyError):
+    raise SystemExit('Nie można potwierdzić zakończenia cloud-init.')
+if status not in ('done', 'error', 'disabled'):
+    raise SystemExit('Cloud-init jeszcze pracuje; pozostaw instalację uruchomioną.')
+if d.get('resume_unit'):
+    previous = subprocess.run(['systemctl', 'is-active', d['resume_unit']], capture_output=True, text=True).stdout.strip()
+    if previous in ('activating', 'active', 'reloading'):
+        raise SystemExit('Poprzednie wznowienie jeszcze działa; użyj --finish.')
+routes = json.loads(subprocess.check_output(['ip', '-j', '-4', 'route', 'show', 'default']))
+addresses = json.loads(subprocess.check_output(['ip', '-j', '-4', 'addr', 'show', 'dev', routes[0]['dev'], 'scope', 'global']))
+address = ipaddress.IPv4Address(addresses[0]['addr_info'][0]['local'])
+network = ipaddress.IPv4Network(d['school_lan'])
+if address not in network or address in (network.network_address, network.broadcast_address):
+    raise SystemExit('Adres VM poza wskazanym LAN: ' + str(address))
+if not Path('/opt/school-rmm').is_dir():
+    raise SystemExit('Brak wcześniej wypakowanych źródeł; wymagane sprawdzenie przed wznowieniem.')
+subprocess.run([sys.executable, '-c', d['source_setup'], '/var/lib/school-rmm/source.tar.gz', '/opt/school-rmm', d['source_sha']], check=True)
+print('Adres VM:', address, 'Dozwolony LAN:', network)
+'''
+    print(guest_exec(["python3", "-c", check], data=json.dumps({
+        "school_lan": school_lan, "resume_unit": state.get("resume_unit"),
+        "source_setup": SOURCE_SETUP, "source_sha": SOURCE_SHA256,
+    }).encode(), timeout=60).strip(), flush=True)
+    attempt = uuid.uuid4().hex[:12]
+    print("Tworzę snapshot VM 104 przed wznowieniem; zachowuję istniejący dysk i dane...", flush=True)
+    run(["qm", "snapshot", str(VMID), "before-resume-" + attempt,
+         "--description", "Stan przed poprawką LAN School RMM"], timeout=180)
+    files = [item for item in guest_config(b"", school_lan=school_lan)["write_files"]
+             if item["path"] != "/var/lib/school-rmm/source.tar.gz"]
+    repair = r'''
+import json, os, shutil, subprocess, sys, tempfile
+from pathlib import Path
+d = json.load(sys.stdin)
+backup = Path('/var/backups/school-rmm') / d['attempt']
+for item in d['files']:
+    path = Path(item['path'])
+    if path.is_symlink() or (path.exists() and not path.is_file()) or any(parent.is_symlink() for parent in path.parents):
+        raise SystemExit('Niestandardowa ścieżka instalatora; zachowano pliki: ' + str(path))
+backup.mkdir(mode=0o700, parents=True)
+for item in d['files']:
+    path = Path(item['path'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        destination = backup / path.relative_to('/')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+    descriptor, name = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    with os.fdopen(descriptor, 'w') as output:
+        output.write(item['content'])
+    os.chmod(name, int(item['permissions'], 8))
+    os.replace(name, path)
+subprocess.run(['/usr/local/sbin/school-rmm-firewall'], check=True)
+subprocess.run(['systemctl', 'daemon-reload'], check=True)
+# A previous ready file must not report success while the repair is still running.
+ready = Path('/var/lib/school-rmm-install.ready')
+if ready.exists():
+    ready.rename(backup / 'previous-ready.json')
+subprocess.run(['systemd-run', '--no-block', '--unit', d['unit'], '--property=Type=oneshot',
+                '--property=RemainAfterExit=yes', '/usr/local/sbin/school-rmm-firstboot'], check=True)
+print('Wznowiono instalację. Kopia plików instalatora:', backup)
+'''
+    state.update({"school_lan": school_lan, "resume_unit": "school-rmm-resume-" + attempt + ".service"})
+    save_state(state)
+    print(guest_exec(["python3", "-c", repair], data=json.dumps({
+        "files": files, "attempt": attempt, "unit": state["resume_unit"],
+    }).encode(), timeout=90).strip(), flush=True)
+    return state
+
+
+def installation_failure(resume_unit=None):
+    """Read first-boot outcome without treating cloud-init's error exit as an RPC error."""
+    code = (
+        "import json,subprocess; from pathlib import Path; "
+        "p=subprocess.run(['cloud-init','status','--format','json'], capture_output=True, text=True); "
+        "log=Path('/var/log/school-rmm-install.log'); "
+        "print(json.dumps({'returncode':p.returncode, 'status':p.stdout[-1500:], "
+        "'log':log.read_text(errors='replace')[-3000:] if log.exists() else 'Brak logu instalacji'}))"
+    )
+    if resume_unit:
+        code = (
+            "import json,subprocess,sys; from pathlib import Path; "
+            "p=subprocess.run(['systemctl','show',sys.argv[1],'-p','LoadState','-p','ActiveState','-p','Result'], capture_output=True, text=True); "
+            "log=Path('/var/log/school-rmm-install.log'); "
+            "fields=dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line); "
+            "failed=fields.get('LoadState')!='loaded' or fields.get('ActiveState')=='failed' or fields.get('Result','success')!='success'; "
+            "print(json.dumps({'returncode':1 if failed else 0, 'status':p.stdout, "
+            "'log':log.read_text(errors='replace')[-3000:] if log.exists() else 'Brak logu instalacji'}))"
+        )
+    try:
+        report = json.loads(guest_exec(["python3", "-c", code] + ([resume_unit] if resume_unit else []), timeout=15))
+    except (InstallError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return None
+    if report.get("returncode") == 1:
+        return report.get("log") or report.get("status") or "Cloud-init zgłosił błąd."
+    return None
+
+
+def wait_ready(school_lan=SCHOOL_LAN, resume_unit=None):
     print("Czekam na DHCP, instalację pakietów i uruchomienie HTTPS (do 25 minut)...", flush=True)
     deadline = time.monotonic() + 25 * 60
     while time.monotonic() < deadline:
         try:
             status = json.loads(guest_exec(["cat", "/var/lib/school-rmm-install.ready"], timeout=15))
             address = ipaddress.IPv4Address(status["ip"])
-            if address not in ipaddress.IPv4Network("192.168.0.0/24") or str(address) in {"192.168.0.0", "192.168.0.250", "192.168.0.255"} or status["revision"] != REVISION:
+            if (not valid_address(str(address), school_lan) or status["revision"] != REVISION
+                    or status.get("url") != f"https://{address}/"):
                 raise InstallError("Nieoczekiwany raport gotowości VM.")
             return status
         except (InstallError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            failure = installation_failure(resume_unit)
+            if failure:
+                raise InstallError("Instalacja wewnątrz VM zakończyła się błędem; zachowano VM i dysk.\n" + failure)
             print(".", end="", flush=True)
             time.sleep(10)
     raise InstallError("Upłynął czas instalacji. VM zachowano. Odczytaj /var/log/school-rmm-install.log przez qm guest exec 104.")
 
 
 def bootstrap_admin():
+    existing = guest_exec(["docker", "compose", "-f", "/opt/school-rmm/deploy/compose.yaml", "exec", "-T", "app",
+                          "python", "manage.py", "shell", "-c",
+                          "from django.contrib.auth.models import User; print('RMM_ADMIN_EXISTS' if User.objects.filter(is_superuser=True,is_active=True).exists() else 'RMM_ADMIN_NEEDED')"], timeout=60)
+    if "RMM_ADMIN_EXISTS" in existing.splitlines():
+        print("Zachowano istniejące konto administratora i jego hasło.")
+        return
     print("\nUstaw imienne konto aplikacji. Hasło nie będzie wyświetlone ani zapisane w pliku.", flush=True)
     username = input("Login administratora [maciejnajwer]: ").strip() or "maciejnajwer"
     if not re.fullmatch(r"[A-Za-z0-9_.@+-]{1,150}", username):
@@ -297,7 +508,11 @@ def bootstrap_admin():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--finish", action="store_true", help="Finish this installer's existing VM; never recreates disks.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--finish", action="store_true", help="Finish this installer's existing VM; never recreates disks.")
+    mode.add_argument("--resume", action="store_true", help="Resume a failed installation on the owned VM 104, preserving disks and data.")
+    parser.add_argument("--school-lan", required=True, type=school_network,
+                        help="Explicit school LAN CIDR, e.g. 192.168.16.0/22. Do not infer it from the pve address.")
     args = parser.parse_args()
     if os.geteuid() != 0 or socket.gethostname().split(".")[0] != NODE:
         raise InstallError("Uruchom na hoście pve w istniejącej sesji root@pve.")
@@ -309,11 +524,12 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if "--pass-stdin" not in run(["qm", "help", "guest", "exec"], timeout=30):
         raise InstallError("Zainstalowany qm nie deklaruje --pass-stdin; przerwano przed zmianami.")
-    if args.finish:
-        state = json.loads((STATE_DIR / "104.json").read_text())
-        config = api(f"/nodes/{NODE}/qemu/{VMID}/config")
-        if state["vmid"] != VMID or config.get("description") != state["marker"]:
-            raise InstallError("VM 104 nie jest jednoznacznie własnością tego instalatora.")
+    if args.finish or args.resume:
+        state = owned_state()
+        if args.resume:
+            state = resume_vm(state, args.school_lan)
+        elif state.get("school_lan") != args.school_lan:
+            raise InstallError("Konfiguracja LAN wymaga --resume; --finish nie zmienia zapory istniejącej VM.")
         work = Path(state["work"])
     else:
         resources = api("/cluster/resources", "--type", "vm")
@@ -348,18 +564,22 @@ def main():
         if authorized_keys.is_file():
             public_keys = [line.strip() for line in authorized_keys.read_text().splitlines()
                            if line.strip() and not line.lstrip().startswith("#")]
-        create_vm(work, source.read_bytes(), image, public_keys)
-    status = wait_ready()
+        state = create_vm(work, source.read_bytes(), image, public_keys, args.school_lan)
+    status = wait_ready(args.school_lan, state.get("resume_unit"))
     ca_path = work / "school-rmm-ca.crt"
     ca_path.write_text(guest_exec(["cat", "/opt/school-rmm/school-rmm-ca.crt"]))
-    client = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(ca_path))))
-    with client.open("https://" + status["ip"] + "/healthz/", timeout=15) as response:
-        if json.load(response).get("status") != "ok":
-            raise InstallError("HTTPS nie potwierdził gotowości aplikacji.")
+    # pve's management subnet need not belong to the school client LAN. Probe
+    # through QGA inside the guest; do not create a firewall exception for pve.
+    response = guest_exec(["curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
+                           "--max-time", "15", "--cacert", "/opt/school-rmm/school-rmm-ca.crt",
+                           "https://" + status["ip"] + "/healthz/"], timeout=30)
+    if json.loads(response).get("status") != "ok":
+        raise InstallError("HTTPS nie potwierdził gotowości aplikacji.")
+    (STATE_DIR / "school-rmm-104-ca.crt").write_text(ca_path.read_text())
     bootstrap_admin()
     print("\nPanel działa: https://" + status["ip"] + "/")
-    print("Publiczny certyfikat CA do pobrania na Maca przez istniejące SSH: " + str(ca_path))
+    print("Dozwolony LAN: " + args.school_lan)
+    print("Publiczny certyfikat CA do pobrania na Maca przez istniejące SSH: " + str(STATE_DIR / "school-rmm-104-ca.crt"))
     print("Zaufaj temu CA w Pęku kluczy przed otwarciem panelu. Nie wyłączaj weryfikacji TLS.")
     print("Adres pochodzi z DHCP — zarezerwuj go w routerze dla nowej VM. Raport i obraz zachowano: " + str(work))
     print("VM 100, 101 i 103 nie były modyfikowane. Zdalne zarządzanie agentami pozostaje osobnym etapem.")

@@ -1,10 +1,14 @@
 """Local safety tests with a simulated Proxmox CLI. No hypervisor connection is made."""
 import base64
+import argparse
+import hashlib
+import io
 import json
 import shlex
 import subprocess
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 from deploy import provision_pve as p
@@ -171,13 +175,13 @@ class LANOnlyTests(unittest.TestCase):
             return fields[fields.index("-j")+1]
         return "NO_RULE"
 
-    def test_school_clients_and_proxmox_are_allowed(self):
-        for address in ("192.168.0.10", "192.168.0.84", "192.168.0.250"):
+    def test_school_clients_and_vm_are_in_the_same_slash22(self):
+        for address in ("192.168.16.1", "192.168.17.206", "192.168.18.2", "192.168.19.254"):
             with self.subTest(address=address):
                 self.assertEqual(self.verdict(address), "RETURN")
 
     def test_other_private_vpn_and_internet_clients_are_dropped(self):
-        for address in ("192.168.17.206", "10.0.0.5", "100.64.0.2", "203.0.113.5"):
+        for address in ("192.168.0.250", "192.168.15.254", "192.168.20.1", "10.0.0.5", "100.64.0.2", "203.0.113.5"):
             with self.subTest(address=address):
                 self.assertEqual(self.verdict(address), "DROP")
 
@@ -197,9 +201,173 @@ class LANOnlyTests(unittest.TestCase):
         self.assertIn("Before=docker.service", unit)
         self.assertNotIn("Requires=docker.service", unit)
         subprocess.run(["bash", "-n"], input=self.firewall.encode(), check=True)
+        subprocess.run(["bash", "-n"], input=self.files["/usr/local/sbin/school-rmm-firstboot"].encode(), check=True)
 
     def test_guest_package_installation_uses_supported_apt_ipv4_setting(self):
         self.assertEqual(self.files["/etc/apt/apt.conf.d/99-school-rmm-ipv4"], 'Acquire::ForceIPv4 "true";\n')
+
+    def test_only_explicit_private_networks_are_accepted(self):
+        self.assertEqual(p.school_network("192.168.16.0/22"), "192.168.16.0/22")
+        for value in ("0.0.0.0/0", "192.168.17.206/22", "127.0.0.0/8", "100.64.0.0/10", "203.0.113.0/24", "::/0", "192.168.16.1;reboot"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                p.school_network(value)
+
+    def test_configured_cidr_controls_firewall_and_readiness_boundaries(self):
+        files = {item["path"]:item["content"] for item in p.guest_config(b"source", school_lan="10.20.30.0/24")["write_files"]}
+        self.assertIn("-s 10.20.30.0/24 -j RETURN", files["/usr/local/sbin/school-rmm-firewall"])
+        self.assertIn("IPv4Network('10.20.30.0/24')", files["/usr/local/sbin/school-rmm-firstboot"])
+        self.assertTrue(p.valid_address("192.168.18.2", p.SCHOOL_LAN))
+        for value in ("192.168.16.0", "192.168.19.255", "192.168.20.1"):
+            self.assertFalse(p.valid_address(value, p.SCHOOL_LAN))
+
+
+class SourceReuseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.archive = self.root / "source.tar.gz"
+        with tarfile.open(self.archive, "w:gz") as stream:
+            for name, data in (("manage.py", b"print('fixture')\n"), ("deploy/init.py", b"# fixture\n")):
+                info = tarfile.TarInfo("revision/" + name)
+                info.size, info.mode = len(data), 0o644
+                stream.addfile(info, io.BytesIO(data))
+        self.checksum = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.app = self.root / "app"
+
+    def prepare(self, checksum=None):
+        return subprocess.run(["python3", "-c", p.SOURCE_SETUP, str(self.archive), str(self.app), checksum or self.checksum], capture_output=True, text=True)
+
+    def test_extract_then_resume_preserves_settings_key_database_and_source(self):
+        self.assertEqual(self.prepare().returncode, 0)
+        settings = {"deploy/.env":b"configured-address", "deploy/runtime/django.key":b"fixture-key", "data/db.sqlite3":b"fixture-db"}
+        for name, content in settings.items():
+            file = self.app / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(content)
+        timestamps = {name:(self.app/name).stat().st_mtime_ns for name in settings}
+        original = (self.app/"manage.py").stat().st_mtime_ns
+        self.assertEqual(self.prepare().returncode, 0)
+        for name, content in settings.items():
+            self.assertEqual((self.app/name).read_bytes(), content)
+            self.assertEqual((self.app/name).stat().st_mtime_ns, timestamps[name])
+        self.assertEqual((self.app/"manage.py").stat().st_mtime_ns, original)
+
+    def test_changed_source_or_corrupt_archive_stops_without_overwriting(self):
+        self.assertEqual(self.prepare().returncode, 0)
+        source = self.app / "manage.py"
+        source.write_bytes(b"preserve local edit")
+        result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Zmieniony", result.stderr)
+        self.assertEqual(source.read_bytes(), b"preserve local edit")
+        self.assertNotEqual(self.prepare("0"*64).returncode, 0)
+        self.assertEqual(source.read_bytes(), b"preserve local edit")
+
+    def test_linked_existing_source_is_not_followed_or_overwritten(self):
+        self.assertEqual(self.prepare().returncode, 0)
+        source = self.app / "manage.py"
+        source.unlink()
+        other = self.root / "other"
+        other.write_bytes(b"preserve other file")
+        source.symlink_to(other)
+        self.assertNotEqual(self.prepare().returncode, 0)
+        self.assertEqual(other.read_bytes(), b"preserve other file")
+
+
+class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root/"104-work").mkdir()
+        self.state = {"vmid":104, "marker":"school-rmm-installer:" + "a"*32, "work":str(self.root/"104-work")}
+        (self.root/"104.json").write_text(json.dumps(self.state))
+        replacement = patch.object(p, "STATE_DIR", self.root)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    @patch.object(p, "api")
+    def test_foreign_vm_and_foreign_work_directory_are_rejected(self, api):
+        api.return_value = {"name":"school-rmm", "description":"unrelated VM"}
+        with self.assertRaises(p.InstallError): p.owned_state()
+        api.return_value["description"] = self.state["marker"]
+        self.assertEqual(p.owned_state(), self.state)
+        state = dict(self.state, work="/root")
+        (self.root/"104.json").write_text(json.dumps(state))
+        with self.assertRaises(p.InstallError): p.owned_state()
+
+    @patch.object(p, "guest_exec")
+    @patch.object(p, "run")
+    @patch.object(p, "api")
+    def test_resume_snapshots_owned_vm_then_updates_only_installer_files(self, api, run, guest):
+        api.side_effect = [{"name":"school-rmm", "description":self.state["marker"]}, {"status":"running"}]
+        events = []
+        guest.side_effect = lambda *a, **k: events.append("guest") or "ok"
+        run.side_effect = lambda *a, **k: events.append("snapshot") or ""
+        state = p.resume_vm(self.state, p.SCHOOL_LAN)
+        self.assertEqual(events, ["guest", "snapshot", "guest"])
+        self.assertEqual(run.call_args.args[0][:3], ["qm", "snapshot", "104"])
+        repair_payload = json.loads(guest.call_args.kwargs["data"])
+        paths = {item["path"] for item in repair_payload["files"]}
+        self.assertNotIn("/var/lib/school-rmm/source.tar.gz", paths)
+        self.assertTrue(all(path.startswith(("/usr/local/sbin/school-rmm-", "/etc/")) for path in paths))
+        self.assertIn("--no-block", guest.call_args.args[0][2])
+        self.assertEqual(state["school_lan"], "192.168.16.0/22")
+        self.assertEqual(json.loads((self.root/"104.json").read_text()), state)
+
+    @patch.object(p, "guest_exec", side_effect=p.InstallError("Źródła zmienione lub cloud-init pracuje"))
+    @patch.object(p, "run")
+    @patch.object(p, "api")
+    def test_failed_read_only_check_stops_before_snapshot_or_repair(self, api, run, guest):
+        api.side_effect = [{"name":"school-rmm", "description":self.state["marker"]}, {"status":"running"}]
+        with self.assertRaises(p.InstallError): p.resume_vm(self.state, p.SCHOOL_LAN)
+        run.assert_not_called()
+        self.assertEqual(guest.call_count, 1)
+
+    @patch.object(p, "guest_exec")
+    def test_finish_preserves_existing_admin_without_prompt_or_password_reset(self, guest):
+        guest.return_value = "RMM_ADMIN_EXISTS\n"
+        with patch("builtins.input", side_effect=AssertionError("Unexpected prompt")), patch.object(p.getpass, "getpass", side_effect=AssertionError("Unexpected password prompt")):
+            p.bootstrap_admin()
+        self.assertEqual(guest.call_count, 1)
+
+
+class BootDiagnosticsTests(unittest.TestCase):
+    @patch.object(p, "guest_exec")
+    def test_running_resume_ignores_the_previous_cloud_init_error(self, guest):
+        guest.return_value = json.dumps({"returncode":0, "status":"ActiveState=activating", "log":"old cloud-init error"})
+        self.assertIsNone(p.installation_failure("school-rmm-resume-fixture.service"))
+        command = guest.call_args.args[0]
+        self.assertIn("systemctl", command[2])
+        self.assertNotIn("cloud-init", command[2])
+        self.assertEqual(command[3], "school-rmm-resume-fixture.service")
+
+    @patch.object(p, "installation_failure")
+    @patch.object(p, "guest_exec")
+    def test_ready_slash22_vm_is_accepted_even_with_historical_cloud_init_error(self, guest, failure):
+        status = {"ip":"192.168.18.2", "url":"https://192.168.18.2/", "revision":p.REVISION}
+        guest.return_value = json.dumps(status)
+        self.assertEqual(p.wait_ready(p.SCHOOL_LAN, "resume.service"), status)
+        failure.assert_not_called()
+
+    @patch.object(p, "guest_exec")
+    def test_completed_cloud_init_failure_returns_actual_installation_error(self, guest):
+        guest.return_value = json.dumps({"returncode":1, "status":"error", "log":"Nieoczekiwana sieć DHCP: 192.168.18.2"})
+        self.assertIn("192.168.18.2", p.installation_failure())
+
+    @patch.object(p, "guest_exec")
+    def test_unavailable_agent_does_not_claim_cloud_init_failed(self, guest):
+        guest.side_effect = p.InstallError("Agent not responding")
+        self.assertIsNone(p.installation_failure())
+
+    @patch.object(p.time, "sleep")
+    @patch.object(p, "installation_failure", return_value="Nieoczekiwana sieć DHCP: 192.168.18.2")
+    @patch.object(p, "guest_exec", side_effect=p.InstallError("Ready file missing"))
+    def test_boot_failure_stops_waiting_without_another_25_minute_delay(self, guest, failure, sleep):
+        with self.assertRaisesRegex(p.InstallError, "192.168.18.2"):
+            p.wait_ready()
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":
