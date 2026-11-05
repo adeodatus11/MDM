@@ -6,6 +6,9 @@ Profil startowy tego instalatora to 2 vCPU, 2 GiB RAM i 40 GiB dysku;
 ponownie sprawdza zasoby i chroni istniejące VM oraz kontenery.
 
 Pakiet uruchamia panel School RMM, Gunicorn i Caddy z HTTPS oraz obowiązkowym MFA.
+Docelowy dostęp jest wyłącznie z sieci szkolnej 192.168.0.0/24. Instalator VM 104
+wdraża odpowiednią zaporę; sam plik Compose nie zastępuje tej zapory. Nie udostępniać
+panelu przez Internet, VPN dla administratorów zewnętrznych ani publiczny tunel.
 Nie instaluje jeszcze MeshCentral ani nie wykonuje zadań na komputerach Windows.
 Kontenery aplikacji uruchamia się wewnątrz osobnej VM Linux, nie na hoście Proxmox.
 
@@ -15,8 +18,9 @@ Węzeł wskazany przez właściciela: `pve`, API `https://192.168.0.250:8006`.
 Próba odczytu API zatrzymała się na proxy środowiska (CONNECT 403), przed
 połączeniem z Proxmox. Nie utworzono VM, nie zmieniono sieci ani istniejących maszyn.
 Użytkownik wskazał SSH root@192.168.0.250:22 z istniejącym kluczem, jednak ten
-klucz ani agent SSH nie są dostępne w tej sesji. Wymagane są połączenie VPN,
-grant TCP 192.168.0.250/32, klucz/agent oraz zweryfikowany wpis hosta SSH.
+klucz ani agent SSH nie są dostępne w tej sesji. Instalację wykonuje właściciel
+z lokalnej sieci przez istniejący terminal SSH. Połączenie z chmury do szkolnej
+sieci i VPN nie są potrzebne do tego wdrożenia.
 Wcześniej zapisany wymóg tokenu API nie jest potrzebny przy wybranej ścieżce SSH.
 Nie wystawiać panelu Proxmox do Internetu w celu obejścia tego wymagania.
 

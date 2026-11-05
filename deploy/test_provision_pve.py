@@ -1,6 +1,8 @@
 """Local safety tests with a simulated Proxmox CLI. No hypervisor connection is made."""
 import base64
 import json
+import shlex
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -53,7 +55,7 @@ class ArtifactTests(unittest.TestCase):
             file = Path(directory)/"file"
             file.write_bytes(b"abc")
             self.assertEqual(p.digest(file), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
-        config = p.guest_config(b"public source archive", "192.168.17.206")
+        config = p.guest_config(b"public source archive")
         self.assertFalse(config["ssh_pwauth"])
         self.assertTrue(config["users"][0]["lock_passwd"])
         self.assertNotIn("password", config["users"][0])
@@ -90,7 +92,7 @@ class CreationTests(unittest.TestCase):
     @patch.object(p,"api")
     def test_only_new_vm_is_modified_and_snapshot_precedes_start(self, api, run):
         api.side_effect = [[], {"unused0":"local-zfs:vm-104-disk-0"}]
-        p.create_vm(self.root, b"source", self.root/"image", "192.168.17.206")
+        p.create_vm(self.root, b"source", self.root/"image")
         commands = [call.args[0] for call in run.call_args_list]
         vm_commands = [command for command in commands if command[0]=="qm"]
         self.assertTrue(all(command[2]=="104" for command in vm_commands))
@@ -103,7 +105,7 @@ class CreationTests(unittest.TestCase):
     def test_foreign_or_ambiguous_import_volume_stops_before_attach_or_start(self, api, run):
         api.side_effect = [[], {"unused0":"local-zfs:vm-100-disk-0"}]
         with self.assertRaises(p.InstallError):
-            p.create_vm(self.root, b"source", self.root/"image", "192.168.17.206")
+            p.create_vm(self.root, b"source", self.root/"image")
         commands = [call.args[0][:2] for call in run.call_args_list]
         self.assertNotIn(["qm","set"],commands)
         self.assertNotIn(["qm","start"],commands)
@@ -113,8 +115,53 @@ class CreationTests(unittest.TestCase):
     def test_existing_snippet_storage_is_not_overwritten(self, api, run):
         api.return_value = [{"storage":p.SNIPPET_STORAGE}]
         with self.assertRaises(p.InstallError):
-            p.create_vm(self.root, b"source", self.root/"image", "192.168.17.206")
+            p.create_vm(self.root, b"source", self.root/"image")
         run.assert_not_called()
+
+
+class LANOnlyTests(unittest.TestCase):
+    def setUp(self):
+        self.files = {item["path"]:item["content"] for item in p.guest_config(b"source")["write_files"]}
+        self.firewall = self.files["/usr/local/sbin/school-rmm-firewall"]
+
+    def verdict(self, address):
+        # Evaluate the actual generated IPv4 rule list for representative clients.
+        import ipaddress
+        for line in self.firewall.splitlines():
+            if not line.startswith("-A SCHOOL_RMM_WEB "):
+                continue
+            fields = shlex.split(line)
+            if "-s" in fields and ipaddress.ip_address(address) not in ipaddress.ip_network(fields[fields.index("-s")+1]):
+                continue
+            return fields[fields.index("-j")+1]
+        return "NO_RULE"
+
+    def test_school_clients_and_proxmox_are_allowed(self):
+        for address in ("192.168.0.10", "192.168.0.84", "192.168.0.250"):
+            with self.subTest(address=address):
+                self.assertEqual(self.verdict(address), "RETURN")
+
+    def test_other_private_vpn_and_internet_clients_are_dropped(self):
+        for address in ("192.168.17.206", "10.0.0.5", "100.64.0.2", "203.0.113.5"):
+            with self.subTest(address=address):
+                self.assertEqual(self.verdict(address), "DROP")
+
+    def test_no_existing_connection_or_ssh_peer_exception(self):
+        self.assertNotIn("ESTABLISHED", self.firewall)
+        self.assertNotIn("SSH_CONNECTION", self.firewall)
+        self.assertNotIn("192.168.17.", self.firewall)
+        self.assertIn("--dport 22 -j SCHOOL_RMM_WEB", self.firewall)
+        self.assertIn("--dport 8443 -j SCHOOL_RMM_WEB", self.firewall)
+        self.assertIn("-A SCHOOL_RMM_WEB6 -j DROP", self.firewall)
+
+    def test_firewall_is_required_before_docker_start_and_script_has_valid_syntax(self):
+        dependency = self.files["/etc/systemd/system/docker.service.d/school-rmm-firewall.conf"]
+        self.assertIn("Requires=school-rmm-firewall.service", dependency)
+        self.assertIn("After=school-rmm-firewall.service", dependency)
+        unit = self.files["/etc/systemd/system/school-rmm-firewall.service"]
+        self.assertIn("Before=docker.service", unit)
+        self.assertNotIn("Requires=docker.service", unit)
+        subprocess.run(["bash", "-n"], input=self.firewall.encode(), check=True)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ IMAGE_BASE = "https://cloud-images.ubuntu.com/noble/current/"
 STATE_DIR = Path("/var/lib/vz/school-rmm-install")
 SNIPPET_ROOT = Path("/var/lib/vz/school-rmm-104-snippets")
 GIB = 1024 ** 3
+SCHOOL_LAN = "192.168.0.0/24"
 
 
 class InstallError(RuntimeError):
@@ -105,29 +106,50 @@ def guest_exec(command, *, data=None, timeout=60):
     return result.get("out-data", "")
 
 
-def guest_config(source, admin_ip, public_keys=None):
+def guest_config(source, public_keys=None):
     # These files contain public source code/settings only. Passwords are entered later.
+    if public_keys is not None and (not isinstance(public_keys, list) or any(not isinstance(key, str) for key in public_keys)):
+        raise ValueError("Publiczne klucze SSH muszą być listą wpisów.")
     firewall = r'''#!/bin/bash
 set -euo pipefail
 iface=$(ip -4 route show default | awk 'NR==1 {print $5}')
 test -n "$iface"
-iptables -w -n -L DOCKER-USER >/dev/null
-if iptables -w -n -L SCHOOL_RMM_WEB >/dev/null 2>&1; then
-    iptables -w -F SCHOOL_RMM_WEB
-else
-    iptables -w -N SCHOOL_RMM_WEB
-fi
-iptables -w -A SCHOOL_RMM_WEB -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-iptables -w -A SCHOOL_RMM_WEB -s @ADMIN_IP@/32 -j RETURN
-iptables -w -A SCHOOL_RMM_WEB -s 192.168.0.250/32 -j RETURN
-iptables -w -A SCHOOL_RMM_WEB -j DROP
+iptables -w -n -L DOCKER-USER >/dev/null 2>&1 || iptables -w -N DOCKER-USER
+# Replace this installer's chain as one ruleset; do not temporarily empty it.
+iptables-restore --wait --noflush <<'RMM_IPV4'
+*filter
+:SCHOOL_RMM_WEB - [0:0]
+-A SCHOOL_RMM_WEB -s @SCHOOL_LAN@ -j RETURN
+-A SCHOOL_RMM_WEB -j DROP
+COMMIT
+RMM_IPV4
 iptables -w -C DOCKER-USER -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB 2>/dev/null || \
     iptables -w -I DOCKER-USER 1 -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB
-'''.replace("@ADMIN_IP@", str(ipaddress.IPv4Address(admin_ip)))
+iptables -w -C INPUT -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB 2>/dev/null || \
+    iptables -w -I INPUT 1 -i "$iface" -p tcp --dport 22 -j SCHOOL_RMM_WEB
+# This deployment uses an IPv4-only LAN. Do not leave an IPv6 management path.
+if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 0 ]; then
+    ip6tables-restore --wait --noflush <<'RMM_IPV6'
+*filter
+:SCHOOL_RMM_WEB6 - [0:0]
+-A SCHOOL_RMM_WEB6 -j DROP
+COMMIT
+RMM_IPV6
+    for port in 22 443; do
+        ip6tables -w -C INPUT -i "$iface" -p tcp --dport "$port" -j SCHOOL_RMM_WEB6 2>/dev/null || \
+            ip6tables -w -I INPUT 1 -i "$iface" -p tcp --dport "$port" -j SCHOOL_RMM_WEB6
+    done
+    if ip6tables -w -n -L DOCKER-USER >/dev/null 2>&1; then
+        ip6tables -w -C DOCKER-USER -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB6 2>/dev/null || \
+            ip6tables -w -I DOCKER-USER 1 -i "$iface" -p tcp --dport 8443 -j SCHOOL_RMM_WEB6
+    fi
+fi
+'''.replace("@SCHOOL_LAN@", SCHOOL_LAN)
     unit = '''[Unit]
 Description=School RMM HTTPS access restriction
-After=docker.service
-Requires=docker.service
+Wants=network-online.target
+After=network-online.target
+Before=docker.service
 PartOf=docker.service
 [Service]
 Type=oneshot
@@ -136,10 +158,16 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 '''
+    docker_dependency = '''[Unit]
+Requires=school-rmm-firewall.service
+After=school-rmm-firewall.service
+'''
     bootstrap = r'''#!/bin/bash
 set -euo pipefail
 umask 077
 exec > >(tee -a /var/log/school-rmm-install.log) 2>&1
+systemctl daemon-reload
+systemctl enable --now school-rmm-firewall.service
 systemctl enable --now qemu-guest-agent docker
 printf '%s  %s\n' '@SOURCE_SHA@' /var/lib/school-rmm/source.tar.gz | sha256sum --check -
 test ! -e /opt/school-rmm
@@ -153,8 +181,6 @@ python3 deploy/init_deployment.py --hostname "$address" --bind-address "$address
 export DOCKER_BUILDKIT=1
 docker compose -f deploy/compose.yaml build
 docker compose -f deploy/compose.yaml up -d --no-build --wait --wait-timeout 180
-systemctl daemon-reload
-systemctl enable --now school-rmm-firewall.service
 docker compose -f deploy/compose.yaml cp proxy:/data/caddy/pki/authorities/local/root.crt ./school-rmm-ca.crt
 curl --fail --silent --show-error --noproxy '*' --cacert school-rmm-ca.crt "https://$address/healthz/"
 python3 - "$address" <<'PY_STATUS'
@@ -177,12 +203,13 @@ PY_STATUS
             {"path": "/usr/local/sbin/school-rmm-firstboot", "permissions": "0700", "content": bootstrap},
             {"path": "/usr/local/sbin/school-rmm-firewall", "permissions": "0700", "content": firewall},
             {"path": "/etc/systemd/system/school-rmm-firewall.service", "permissions": "0644", "content": unit},
+            {"path": "/etc/systemd/system/docker.service.d/school-rmm-firewall.conf", "permissions": "0644", "content": docker_dependency},
         ],
         "runcmd": [["bash", "/usr/local/sbin/school-rmm-firstboot"]],
     }
 
 
-def create_vm(work, source, image, admin_ip, public_keys=None):
+def create_vm(work, source, image, public_keys=None):
     snippet_root = SNIPPET_ROOT
     if snippet_root.exists() or SNIPPET_STORAGE in {item["storage"] for item in api("/storage")}:
         raise InstallError("Miejsce na konfigurację cloud-init już istnieje. Przerwano bez nadpisywania.")
@@ -190,7 +217,7 @@ def create_vm(work, source, image, admin_ip, public_keys=None):
     (snippet_root / "snippets").mkdir(mode=0o755)
     user_data = snippet_root / "snippets" / "school-rmm-104.yaml"
     with user_data.open("x") as stream:
-        stream.write("#cloud-config\n" + json.dumps(guest_config(source, admin_ip, public_keys), indent=2))
+        stream.write("#cloud-config\n" + json.dumps(guest_config(source, public_keys), indent=2))
     user_data.chmod(0o644)
     run(["pvesm", "add", "dir", SNIPPET_STORAGE, "--path", str(snippet_root), "--content", "snippets", "--nodes", NODE])
     marker = "school-rmm-installer:" + uuid.uuid4().hex
@@ -255,7 +282,6 @@ def bootstrap_admin():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--admin-ip", help="Normally obtained from SSH_CONNECTION.")
     parser.add_argument("--finish", action="store_true", help="Finish this installer's existing VM; never recreates disks.")
     args = parser.parse_args()
     if os.geteuid() != 0 or socket.gethostname().split(".")[0] != NODE:
@@ -275,11 +301,6 @@ def main():
             raise InstallError("VM 104 nie jest jednoznacznie własnością tego instalatora.")
         work = Path(state["work"])
     else:
-        peer = args.admin_ip or os.environ.get("SSH_CONNECTION", "").split(" ")[0]
-        try:
-            admin_ip = str(ipaddress.IPv4Address(peer))
-        except ValueError as exc:
-            raise InstallError("Nie wykryto adresu klienta SSH. Podaj --admin-ip z adresem swojego Maca.") from exc
         resources = api("/cluster/resources", "--type", "vm")
         status = api(f"/nodes/{NODE}/status")
         storage = api(f"/nodes/{NODE}/storage")
@@ -312,7 +333,7 @@ def main():
         if authorized_keys.is_file():
             public_keys = [line.strip() for line in authorized_keys.read_text().splitlines()
                            if line.strip() and not line.lstrip().startswith("#")]
-        create_vm(work, source.read_bytes(), image, admin_ip, public_keys)
+        create_vm(work, source.read_bytes(), image, public_keys)
     status = wait_ready()
     ca_path = work / "school-rmm-ca.crt"
     ca_path.write_text(guest_exec(["cat", "/opt/school-rmm/school-rmm-ca.crt"]))

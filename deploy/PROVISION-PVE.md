@@ -23,8 +23,12 @@ Interfejs veth102 wskazuje także kontener — instalator sprawdza wszystkie VM 
 - Przenosi wyłącznie publiczne wpisy z /root/.ssh/authorized_keys do konta utrzymaniowego
   rmmadmin w nowej VM; prywatne klucze pozostają na swoich komputerach. Gdy pliku nie ma,
   obsługa jest dostępna przez agenta QEMU. Logowanie hasłem i SSH root w VM są wyłączone.
-- Uruchamia HTTPS i MFA, ogranicza wejście do panelu do IP bieżącego klienta SSH
-  oraz hosta Proxmox. Reguła dotyczy tylko nowego gościa i jest odtwarzana po starcie Dockera.
+- Uruchamia HTTPS i MFA; panel i SSH nowej VM przyjmują wyłącznie klientów
+  z sieci szkolnej 192.168.0.0/24. Nie dopuszcza automatycznie klienta SSH spoza LAN,
+  adresów VPN ani publicznych IP. Zarządzanie po IPv6 jest zablokowane w tym profilu IPv4.
+- Zapora jest wymagana przed startem Dockera i jest odtwarzana przy jego restarcie.
+  Wykorzystuje DOCKER-USER, ponieważ samo filtrowanie INPUT nie chroni portów Dockera.
+  Zmienia wyłącznie zaporę nowej VM, nie hosta Proxmox ani innych gości.
 - Weryfikuje HTTPS z właściwym CA i pyta w terminalu o imienne konto aplikacji.
   Hasło przechodzi przez stdin agenta do Django, nie przez argumenty procesu ani plik cloud-init.
 
@@ -32,8 +36,16 @@ Interfejs veth102 wskazuje także kontener — instalator sprawdza wszystkie VM 
 
 Pobrać plik instalatora z konkretnego commita, sprawdzić podaną SHA256 i uruchomić
 `python3 /ścieżka/do/instalatora`, z wejściem z terminala. Skrypt potrzebuje dostępu
-do Internetu na Proxmoxie i w nowym gościu oraz DHCP na vmbr0. Nie zgaduje wolnego IP.
+do Internetu na Proxmoxie i w nowym gościu na czas pobrania systemu i pakietów
+oraz DHCP na vmbr0. Zarządzanie komputerami odbywa się w LAN, bez usługi chmurowej,
+tunelu zewnętrznego i przekierowania portów z Internetu. Nie zgaduje wolnego IP.
 DHCP należy następnie zarezerwować w routerze. Adres MAC nowej VM jest w `qm config 104`.
+Nie dodawać przekierowania ani SNAT/VPN, które przedstawiałyby klienta zewnętrznego
+jako adres z sieci szkolnej. Instalator nie zmienia i nie sprawdza routera.
+
+Z Maca należy uruchamiać blok zawierający `ssh -t root@192.168.0.250`.
+Polecenia instalatora wykonują się na pve. Samodzielne uruchomienie bloku z /root
+na Macu kończy się błędem mktemp przed jakąkolwiek zmianą na Proxmoxie.
 
 Nowy certyfikat CA pobrać na Maca przez istniejące, zweryfikowane SSH; dokładną
 ścieżkę na pve poda instalator. Zaufać publicznemu CA w Pęku kluczy przed otwarciem
@@ -54,6 +66,8 @@ delete, stop ani reset dla istniejących VM i nie dotyka /srv/school-ai.
 Testy lokalne używają symulowanych odpowiedzi Proxmoxa. Sprawdzają odrzucanie
 kolizji z VM/LXC, rezerwę RAM i dysku, wybór właściwego wolumenu, snapshot przed
 startem, przekazanie sekretu przez stdin oraz blokowanie operacji na innych ID.
+Sprawdzają też dopuszczenie 192.168.0.x, odrzucenie innych sieci prywatnych,
+adresów VPN i publicznych IP oraz kolejność startu zapory przed Dockerem.
 Nie stanowią wykonania instalatora na rzeczywistym pve. Pierwsze rzeczywiste
 uruchomienie i ewentualną diagnostykę kończymy na wynikach z terminala właściciela.
 
