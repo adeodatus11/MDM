@@ -1,0 +1,4 @@
+{% extends 'inventory/base.html' %}{% block title %}Logowanie · School RMM{% endblock %}
+{% block content %}<section class="login card"><p class="eyebrow">School RMM</p><h1>Zarządzanie szkolnym IT</h1><p class="muted">Zaloguj się do ewidencji komputerów i konfiguracji sal.</p>
+<form method="post">{% csrf_token %}{{ form.as_p }}{% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}<button class="primary">Zaloguj</button></form>
+<p class="muted small">Dostęp wyłącznie dla upoważnionych użytkowników. Brak kont domyślnych.</p></section>{% endblock %}
