@@ -16,6 +16,10 @@ Interfejs veth102 wskazuje także kontener — instalator sprawdza wszystkie VM 
 - Tworzy wyłącznie nową VM 104: 2 vCPU, 2 GiB RAM, 40 GiB na local-zfs, DHCP na vmbr0.
 - Przed utworzeniem gościa pobiera obraz Ubuntu 24.04 z oficjalnego HTTPS,
   sprawdza SHA256SUMS oraz format obrazu. Niezgodność zatrzymuje pracę.
+- Pobieranie na pve używa curl --ipv4, a APT w nowej VM otrzymuje Acquire::ForceIPv4.
+  Wynik diagnostyki właściciela: IPv4 i HTTPS działają, AF_UNSPEC zwraca EAI_AGAIN,
+  proxy HTTPS nie jest skonfigurowane. Nie zmienia to DNS ani ustawień IPv6 hosta pve.
+  Zachowuje weryfikację TLS, podpisy pakietów i kontrolę SHA256.
 - Używa przypiętej, sprawdzonej wersji aplikacji 32f52e4 oraz SHA256 archiwum.
 - Dodaje odrębny storage wyłącznie na snippet cloud-init tej VM; nie zmienia local/local-zfs.
 - Zapisuje raport stanu, tworzy snapshot nowej VM przed jej pierwszym uruchomieniem.

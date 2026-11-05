@@ -65,8 +65,22 @@ def digest(path):
 def download(url, output):
     if not url.startswith("https://"):
         raise InstallError("Pobieranie wymaga HTTPS.")
-    with urllib.request.urlopen(url, timeout=60) as response, Path(output).open("xb") as stream:
-        shutil.copyfileobj(response, stream)
+    output = Path(output)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"Plik już istnieje: {output}")
+    descriptor, name = tempfile.mkstemp(prefix=output.name + ".partial-", dir=output.parent)
+    os.close(descriptor)
+    partial = Path(name)
+    try:
+        run(["curl", "--ipv4", "--fail", "--silent", "--show-error", "--location",
+             "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "20",
+             "--max-time", "1800", "--retry", "2", "--retry-delay", "2",
+             "--retry-max-time", "1800", "--retry-all-errors", "--output", str(partial),
+             "--url", url], timeout=3700)
+        # Publish atomically and refuse a destination created by another process.
+        os.link(partial, output)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def image_checksum(manifest):
@@ -204,6 +218,7 @@ PY_STATUS
             {"path": "/usr/local/sbin/school-rmm-firewall", "permissions": "0700", "content": firewall},
             {"path": "/etc/systemd/system/school-rmm-firewall.service", "permissions": "0644", "content": unit},
             {"path": "/etc/systemd/system/docker.service.d/school-rmm-firewall.conf", "permissions": "0644", "content": docker_dependency},
+            {"path": "/etc/apt/apt.conf.d/99-school-rmm-ipv4", "permissions": "0644", "content": 'Acquire::ForceIPv4 "true";\n'},
         ],
         "runcmd": [["bash", "/usr/local/sbin/school-rmm-firstboot"]],
     }
@@ -286,7 +301,7 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0 or socket.gethostname().split(".")[0] != NODE:
         raise InstallError("Uruchom na hoście pve w istniejącej sesji root@pve.")
-    for binary in ("qm", "pvesh", "pvesm", "qemu-img"):
+    for binary in ("qm", "pvesh", "pvesm", "qemu-img", "curl"):
         if not shutil.which(binary):
             raise InstallError("Brak wymaganego narzędzia: " + binary)
     os.umask(0o077)

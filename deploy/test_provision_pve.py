@@ -44,6 +44,41 @@ class PreflightTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    @patch.object(p, "run")
+    def test_download_uses_ipv4_preserves_tls_and_publishes_complete_file(self, run):
+        def transfer(command, **kwargs):
+            self.assertIn("--ipv4", command)
+            self.assertNotIn("--insecure", command)
+            self.assertNotIn("--noproxy", command)
+            self.assertEqual(command[command.index("--proto")+1], "=https")
+            self.assertEqual(command[command.index("--proto-redir")+1], "=https")
+            Path(command[command.index("--output")+1]).write_bytes(b"complete source")
+        run.side_effect = transfer
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/"artifact"
+            p.download("https://example.com/artifact", output)
+            self.assertEqual(output.read_bytes(), b"complete source")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
+    @patch.object(p, "run")
+    def test_failed_download_does_not_leave_a_verified_looking_artifact(self, run):
+        run.side_effect = p.InstallError("DNS unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/"artifact"
+            with self.assertRaises(p.InstallError):
+                p.download("https://example.com/artifact", output)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    @patch.object(p, "run")
+    def test_download_refuses_http_and_existing_output(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/"artifact"
+            output.write_bytes(b"preserve existing data")
+            with self.assertRaises(FileExistsError): p.download("https://example.com/artifact", output)
+            with self.assertRaises(p.InstallError): p.download("http://example.com/artifact", output)
+            self.assertEqual(output.read_bytes(), b"preserve existing data")
+            run.assert_not_called()
+
     def test_checksum_selects_only_exact_image(self):
         sha = "a"*64
         self.assertEqual(p.image_checksum(f"{'b'*64} *other.img\n{sha} *{p.IMAGE_NAME}\n"), sha)
@@ -162,6 +197,9 @@ class LANOnlyTests(unittest.TestCase):
         self.assertIn("Before=docker.service", unit)
         self.assertNotIn("Requires=docker.service", unit)
         subprocess.run(["bash", "-n"], input=self.firewall.encode(), check=True)
+
+    def test_guest_package_installation_uses_supported_apt_ipv4_setting(self):
+        self.assertEqual(self.files["/etc/apt/apt.conf.d/99-school-rmm-ipv4"], 'Acquire::ForceIPv4 "true";\n')
 
 
 if __name__ == "__main__":
