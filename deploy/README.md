@@ -1,5 +1,10 @@
 # Wdrożenie testowej aplikacji na VM w Proxmox
 
+Gotowy instalator dla nowej VM 104 na wskazanym hoście pve:
+[PROVISION-PVE.md](PROVISION-PVE.md) i `provision_pve.py`.
+Profil startowy tego instalatora to 2 vCPU, 2 GiB RAM i 40 GiB dysku;
+ponownie sprawdza zasoby i chroni istniejące VM oraz kontenery.
+
 Pakiet uruchamia panel School RMM, Gunicorn i Caddy z HTTPS oraz obowiązkowym MFA.
 Nie instaluje jeszcze MeshCentral ani nie wykonuje zadań na komputerach Windows.
 Kontenery aplikacji uruchamia się wewnątrz osobnej VM Linux, nie na hoście Proxmox.
